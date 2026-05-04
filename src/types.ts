@@ -105,6 +105,7 @@ export type Action =
   | { type: "SET_GLOBAL_FILTER"; text: string }
   | { type: "OPEN_QUICK_FILTER" }
   | { type: "CLOSE_QUICK_FILTER" }
+  | { type: "CLEAR_GLOBAL_FILTER" }
   | { type: "SET_VISIBILITY"; column: string; visible: boolean }
   | { type: "SHOW_ALL_COLUMNS" }
   | { type: "SET_TOTAL"; alias: string; total: number }

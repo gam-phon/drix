@@ -540,8 +540,10 @@ export function CollapseHandle({
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
-        gap: 6,
-        padding: "8px 0",
+        gap: 8,
+        // 8px matches the expanded panel's `padding: 8` so the toggle button
+        // ends up at the same vertical offset whether collapsed or expanded.
+        padding: 8,
       }}
     >
       <button
@@ -550,11 +552,13 @@ export function CollapseHandle({
         title={side === "left" ? "Show sidebar" : "Show panel"}
         style={{
           background: "transparent",
-          border: "none",
+          border: "1px solid var(--border)",
+          borderRadius: 6,
           color: "var(--fg-muted)",
           cursor: "pointer",
-          padding: "4px 6px",
-          fontSize: 14,
+          padding: "2px 8px",
+          fontSize: 18,
+          lineHeight: 1,
         }}
       >
         {side === "left" ? "▸" : "◂"}
@@ -591,36 +595,30 @@ export function Sidebar({
         gap: 12,
       }}
     >
-      <button type="button" onClick={onOpen} style={{ width: "100%" }}>
-        + Open .parquet
-      </button>
-      <div>
-        <div
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <button type="button" onClick={onOpen} style={{ flex: 1 }}>
+          + Open .parquet
+        </button>
+        <button
+          type="button"
+          onClick={() => dispatch({ type: "TOGGLE_SIDEBAR" })}
+          title="Hide sidebar"
           style={{
-            ...sidebarHeading,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
+            background: "transparent",
+            border: "1px solid var(--border)",
+            borderRadius: 6,
+            color: "var(--fg-muted)",
+            cursor: "pointer",
+            padding: "2px 8px",
+            fontSize: 18,
+            lineHeight: 1,
           }}
         >
-          <span>Sources</span>
-          <button
-            type="button"
-            onClick={() => dispatch({ type: "TOGGLE_SIDEBAR" })}
-            title="Hide sidebar"
-            style={{
-              background: "transparent",
-              border: "none",
-              color: "var(--fg-muted)",
-              cursor: "pointer",
-              padding: "0 4px",
-              fontSize: 12,
-              lineHeight: 1,
-            }}
-          >
-            ◂
-          </button>
-        </div>
+          ◂
+        </button>
+      </div>
+      <div>
+        <div style={sidebarHeading}>Sources</div>
         {state.sources.length === 0 && (
           <div
             style={{
@@ -830,10 +828,12 @@ function DataGrid({
     const ctrl = e.ctrlKey || e.metaKey;
     const half = Math.max(1, Math.floor(rows.length / 2));
 
-    if (key === "j") {
+    if (key === "j" || key === "n") {
+      // `n` = next match. Because the grid only contains rows that match the
+      // active global filter, "next match" is the same as "next row".
       e.preventDefault();
       moveSelection(1);
-    } else if (key === "k") {
+    } else if (key === "k" || key === "N") {
       e.preventDefault();
       moveSelection(-1);
     } else if (key === "d" && ctrl) {
@@ -1098,10 +1098,14 @@ function QuickFilter({
   value,
   onChange,
   onClose,
+  onClear,
 }: {
   value: string;
   onChange: (v: string) => void;
+  /** Hide the input panel but keep the filter active (vim Esc). */
   onClose: () => void;
+  /** Clear the filter and hide the panel. */
+  onClear: () => void;
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   useEffect(() => {
@@ -1123,7 +1127,7 @@ function QuickFilter({
       <input
         ref={inputRef}
         type="text"
-        placeholder="search across all text columns…"
+        placeholder="search across all text columns — n/N to navigate matches"
         value={value}
         onChange={(e) => onChange(e.target.value)}
         onKeyDown={(e) => {
@@ -1132,12 +1136,74 @@ function QuickFilter({
             onClose();
           } else if (e.key === "Enter") {
             e.preventDefault();
-            (e.target as HTMLInputElement).blur();
+            onClose();
           }
         }}
         style={{ flex: 1, fontFamily: "var(--mono)", fontSize: 12 }}
       />
-      <button type="button" onClick={onClose} title="Close (Esc)">
+      <button type="button" onClick={onClear} title="Clear filter">
+        ×
+      </button>
+    </div>
+  );
+}
+
+// Small inline pill shown above the grid when a global filter is active but
+// the QuickFilter input panel is hidden — gives the user a way to see, edit,
+// or clear the active search.
+function ActiveFilterChip({
+  text,
+  onReopen,
+  onClear,
+}: {
+  text: string;
+  onReopen: () => void;
+  onClear: () => void;
+}) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 4,
+        alignSelf: "flex-start",
+        padding: "2px 6px 2px 8px",
+        background: "var(--chip-bg)",
+        color: "var(--chip-fg)",
+        border: "1px solid transparent",
+        borderRadius: 999,
+        fontSize: 11,
+        fontFamily: "var(--mono)",
+      }}
+    >
+      <button
+        type="button"
+        onClick={onReopen}
+        title="Edit search (/)"
+        style={{
+          background: "transparent",
+          border: "none",
+          color: "inherit",
+          cursor: "pointer",
+          padding: 0,
+          font: "inherit",
+        }}
+      >
+        / {text} <span style={{ color: "var(--fg-muted)" }}>· n / N to navigate</span>
+      </button>
+      <button
+        type="button"
+        onClick={onClear}
+        title="Clear filter"
+        style={{
+          background: "transparent",
+          border: "none",
+          color: "inherit",
+          cursor: "pointer",
+          padding: "0 2px",
+          marginLeft: 2,
+        }}
+      >
         ×
       </button>
     </div>
@@ -1170,12 +1236,21 @@ export function DataTab({
           {numberFmt.format(source.total)} rows
         </span>
       </div>
-      {state.quickFilterOpen && (
+      {state.quickFilterOpen ? (
         <QuickFilter
           value={state.globalFilter}
           onChange={(text) => dispatch({ type: "SET_GLOBAL_FILTER", text })}
           onClose={() => dispatch({ type: "CLOSE_QUICK_FILTER" })}
+          onClear={() => dispatch({ type: "CLEAR_GLOBAL_FILTER" })}
         />
+      ) : (
+        state.globalFilter.trim() !== "" && (
+          <ActiveFilterChip
+            text={state.globalFilter}
+            onReopen={() => dispatch({ type: "OPEN_QUICK_FILTER" })}
+            onClear={() => dispatch({ type: "CLEAR_GLOBAL_FILTER" })}
+          />
+        )
       )}
       <DataGrid
         columns={visible}
@@ -1293,12 +1368,6 @@ export function RowDrawer({
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
-        <div style={{ ...sidebarHeading, padding: 0, flex: 1 }}>Row detail</div>
-        {row && (
-          <button type="button" onClick={onClose} title="Clear selection">
-            ×
-          </button>
-        )}
         {onCollapse && (
           <button
             type="button"
@@ -1306,15 +1375,22 @@ export function RowDrawer({
             title="Hide panel"
             style={{
               background: "transparent",
-              border: "none",
+              border: "1px solid var(--border)",
+              borderRadius: 6,
               color: "var(--fg-muted)",
               cursor: "pointer",
-              padding: "0 4px",
-              fontSize: 14,
+              padding: "2px 8px",
+              fontSize: 18,
               lineHeight: 1,
             }}
           >
             ▸
+          </button>
+        )}
+        <div style={{ ...sidebarHeading, padding: 0, flex: 1 }}>Row detail</div>
+        {row && (
+          <button type="button" onClick={onClose} title="Clear selection">
+            ×
           </button>
         )}
       </div>

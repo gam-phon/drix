@@ -129,6 +129,11 @@ function reducer(state: State, action: Action): State {
     case "OPEN_QUICK_FILTER":
       return { ...state, quickFilterOpen: true };
     case "CLOSE_QUICK_FILTER":
+      // Only hide the input — keep `globalFilter` so vim `n`/`N` can keep
+      // navigating matches after Esc. Use CLEAR_GLOBAL_FILTER to actually
+      // drop the filter.
+      return { ...state, quickFilterOpen: false };
+    case "CLEAR_GLOBAL_FILTER":
       return { ...state, quickFilterOpen: false, globalFilter: "", page: 0 };
     case "SET_VISIBILITY":
       return {
