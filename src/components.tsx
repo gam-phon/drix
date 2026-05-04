@@ -1,7 +1,7 @@
 import { type ColumnDef, flexRender, getCoreRowModel, useReactTable } from "@tanstack/react-table";
 import { type CSSProperties, type Dispatch, useEffect, useMemo, useState } from "react";
-import { fetchFileInfo } from "./duckdb";
 import { formatBytes, formatCell, formatRatio, numberFmt } from "./format";
+import type { ParquetFileInfo, ParquetMeta } from "./formats/parquet/types";
 import { isFilterableSimple, typeChipString } from "./parser";
 import type {
   Action,
@@ -9,12 +9,14 @@ import type {
   DuckDBType,
   FilterOp,
   FilterValue,
-  ParquetFileInfo,
-  ParquetMeta,
   SortEntry,
   Source,
   State,
 } from "./types";
+
+// Treat Column.meta as parquet metadata. The viewer is parquet-only today;
+// when a second adapter is added, replace this with discriminated typing.
+const pmeta = (c: Column): ParquetMeta | undefined => c.meta as ParquetMeta | undefined;
 
 // =========================================================================
 // Shared styles
@@ -293,12 +295,20 @@ function FilterPopover({
 // Type chip
 // =========================================================================
 
-function TypeChip({ type, parquet }: { type: DuckDBType; parquet?: ParquetMeta }) {
+function TypeChip({
+  type,
+  parquet,
+  noTooltip,
+}: {
+  type: DuckDBType;
+  parquet?: ParquetMeta;
+  noTooltip?: boolean;
+}) {
   const [hover, setHover] = useState(false);
   const label = typeChipString(type);
   return (
     <span
-      onMouseEnter={() => setHover(true)}
+      onMouseEnter={() => !noTooltip && setHover(true)}
       onMouseLeave={() => setHover(false)}
       style={{
         display: "inline-block",
@@ -314,7 +324,7 @@ function TypeChip({ type, parquet }: { type: DuckDBType; parquet?: ParquetMeta }
       }}
     >
       {label}
-      {hover && parquet && Object.values(parquet).some((v) => v != null) && (
+      {hover && !noTooltip && parquet && Object.values(parquet).some((v) => v != null) && (
         <span
           style={{
             position: "absolute",
@@ -586,7 +596,7 @@ export function Sidebar({
               <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis" }}>
                 {c.name}
               </span>
-              <TypeChip type={c.type} parquet={c.parquet} />
+              <TypeChip type={c.type} parquet={pmeta(c)} />
             </label>
           ))}
         </div>
@@ -698,7 +708,7 @@ function DataGrid({
                           </span>
                         )}
                       </button>
-                      <TypeChip type={col.type} parquet={col.parquet} />
+                      <TypeChip type={col.type} parquet={pmeta(col)} />
                       <button
                         type="button"
                         onClick={() => setOpenFilter(openFilter === col.name ? null : col.name)}
@@ -1004,7 +1014,7 @@ export function RowDrawer({
                   }}
                 >
                   <span style={{ flex: 1, fontWeight: 600, color: "var(--fg)" }}>{c.name}</span>
-                  <TypeChip type={c.type} parquet={c.parquet} />
+                  <TypeChip type={c.type} parquet={pmeta(c)} />
                 </div>
                 <div style={{ marginTop: 2, fontFamily: "var(--mono)", wordBreak: "break-word" }}>
                   {f.display === "tree" ? (
@@ -1184,9 +1194,10 @@ export function InfoView({ source }: { source: Source }) {
     let cancelled = false;
     setInfo(null);
     setError(null);
-    fetchFileInfo(source.alias, source.fileSizeBytes)
+    source.adapter
+      .fetchFileInfo(source.alias, source.fileSizeBytes)
       .then((i) => {
-        if (!cancelled) setInfo(i);
+        if (!cancelled) setInfo(i as ParquetFileInfo | null);
       })
       .catch((e) => {
         if (!cancelled) setError((e as Error).message);
@@ -1199,19 +1210,18 @@ export function InfoView({ source }: { source: Source }) {
   // Aggregations from columns + info
   const cols = source.columns;
   const numColumns = cols.length;
-  const totalCompressed = cols.reduce((acc, c) => acc + (c.parquet?.totalCompressedSize ?? 0), 0);
+  const totalCompressed = cols.reduce((acc, c) => acc + (pmeta(c)?.totalCompressedSize ?? 0), 0);
   const totalUncompressed = cols.reduce(
-    (acc, c) => acc + (c.parquet?.totalUncompressedSize ?? 0),
+    (acc, c) => acc + (pmeta(c)?.totalUncompressedSize ?? 0),
     0,
   );
-  const totalNulls = cols.reduce((acc, c) => acc + (c.parquet?.statsNullCount ?? 0), 0);
+  const totalNulls = cols.reduce((acc, c) => acc + (pmeta(c)?.statsNullCount ?? 0), 0);
   const compressionTokens = new Set<string>();
   const encodingTokens = new Set<string>();
   for (const c of cols) {
-    if (c.parquet?.compression)
-      for (const t of c.parquet.compression.split(",")) compressionTokens.add(t.trim());
-    if (c.parquet?.encodings)
-      for (const t of c.parquet.encodings.split(",")) encodingTokens.add(t.trim());
+    const m = pmeta(c);
+    if (m?.compression) for (const t of m.compression.split(",")) compressionTokens.add(t.trim());
+    if (m?.encodings) for (const t of m.encodings.split(",")) encodingTokens.add(t.trim());
   }
   const hasNested = cols.some(
     (c) => c.type.kind === "STRUCT" || c.type.kind === "LIST" || c.type.kind === "MAP",
@@ -1314,7 +1324,7 @@ export function InfoView({ source }: { source: Source }) {
             </thead>
             <tbody>
               {cols.map((c, i) => {
-                const p = c.parquet ?? {};
+                const p: ParquetMeta = pmeta(c) ?? {};
                 return (
                   <tr
                     key={c.name}
@@ -1327,7 +1337,7 @@ export function InfoView({ source }: { source: Source }) {
                       <span style={{ fontWeight: 600 }}>{c.name}</span>
                     </Td>
                     <Td>
-                      <TypeChip type={c.type} parquet={c.parquet} />
+                      <TypeChip type={c.type} noTooltip />
                     </Td>
                     <Td align="right">
                       {p.numValues != null ? numberFmt.format(p.numValues) : "—"}

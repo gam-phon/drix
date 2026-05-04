@@ -10,9 +10,10 @@ import {
   StatusBar,
   TopBar,
 } from "./components";
-import { fetchSchema, fetchTotal, getDB, runQuery } from "./duckdb";
+import { fetchTotal, getDB, runQuery } from "./duckdb";
+import { parquetAdapter } from "./formats/parquet";
 import { parseDuckDBType } from "./parser";
-import { buildQuery, buildWhereClause, quoteIdent, quoteLiteral } from "./query";
+import { buildQuery, buildWhereClause, quoteIdent } from "./query";
 import type { Action, Column, Source, State } from "./types";
 
 // =========================================================================
@@ -195,8 +196,11 @@ function App() {
 
   const loadFile = useCallback(
     async (file: File) => {
-      if (!file.name.toLowerCase().endsWith(".parquet")) {
-        dispatch({ type: "SET_ERROR", error: `Only .parquet files are supported (${file.name})` });
+      // Pick the adapter that claims this extension. Today: parquet only.
+      const lower = file.name.toLowerCase();
+      const adapter = [parquetAdapter].find((a) => a.extensions.some((ext) => lower.endsWith(ext)));
+      if (!adapter) {
+        dispatch({ type: "SET_ERROR", error: `Unsupported file format (${file.name})` });
         return;
       }
       dispatch({ type: "SET_LOADING", loading: true });
@@ -206,8 +210,8 @@ function App() {
         const buf = new Uint8Array(await file.arrayBuffer());
         const alias = pickAlias(file, state.sources);
         await db.registerFileBuffer(alias, buf);
-        const columns = await fetchSchema(alias);
-        const total = await fetchTotal(alias, columns, {});
+        const columns = await adapter.fetchSchema(alias);
+        const total = await fetchTotal(adapter, alias, columns, {});
         dispatch({
           type: "ADD_SOURCE",
           source: {
@@ -216,6 +220,7 @@ function App() {
             columns,
             total,
             fileSizeBytes: file.size,
+            adapter,
           },
         });
       } catch (e) {
@@ -237,6 +242,7 @@ function App() {
       dispatch({ type: "SET_LOADING", loading: true });
       try {
         const { sql, params } = buildQuery({
+          adapter: activeSource.adapter,
           alias: activeSource.alias,
           columns: activeSource.columns,
           visibility: state.visibility,
@@ -266,7 +272,12 @@ function App() {
     let cancelled = false;
     (async () => {
       try {
-        const total = await fetchTotal(activeSource.alias, activeSource.columns, debouncedFilters);
+        const total = await fetchTotal(
+          activeSource.adapter,
+          activeSource.alias,
+          activeSource.columns,
+          debouncedFilters,
+        );
         if (!cancelled) dispatch({ type: "SET_TOTAL", alias: activeSource.alias, total });
       } catch {
         // ignore
@@ -312,7 +323,7 @@ function App() {
               .join(", ")}`
           : "";
       const out = "drix_export.csv";
-      const sql = `COPY (SELECT * FROM read_parquet(${quoteLiteral(activeSource.alias)})${
+      const sql = `COPY (SELECT * FROM ${activeSource.adapter.fromExpr(activeSource.alias)}${
         where ? ` WHERE ${where}` : ""
       }${order ? ` ${order}` : ""}) TO '${out}' (FORMAT CSV, HEADER)`;
       if (params.length > 0) {

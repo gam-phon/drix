@@ -1,5 +1,5 @@
 import { castExpr } from "./parser";
-import type { Column, FilterValue, SortEntry } from "./types";
+import type { Column, FilterValue, FormatAdapter, SortEntry } from "./types";
 
 export function quoteIdent(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
@@ -10,6 +10,7 @@ export function quoteLiteral(s: string): string {
 }
 
 export type BuildQueryArgs = {
+  adapter: FormatAdapter;
   alias: string;
   columns: Column[];
   visibility: Record<string, boolean>;
@@ -20,7 +21,7 @@ export type BuildQueryArgs = {
 };
 
 export function buildQuery(args: BuildQueryArgs): { sql: string; params: unknown[] } {
-  const { alias, columns, visibility, sort, filters, page, pageSize } = args;
+  const { adapter, alias, columns, visibility, sort, filters, page, pageSize } = args;
   const params: unknown[] = [];
   const visible = columns.filter((c) => visibility[c.name] !== false);
   const select = visible.length > 0 ? visible.map((c) => quoteIdent(c.name)).join(", ") : "*";
@@ -34,20 +35,21 @@ export function buildQuery(args: BuildQueryArgs): { sql: string; params: unknown
       : "";
   const limit = pageSize;
   const offset = page * pageSize;
-  const sql = `SELECT ${select} FROM read_parquet(${quoteLiteral(alias)})${
+  const sql = `SELECT ${select} FROM ${adapter.fromExpr(alias)}${
     where ? ` WHERE ${where}` : ""
   }${order ? ` ${order}` : ""} LIMIT ${limit} OFFSET ${offset}`;
   return { sql, params };
 }
 
 export function buildCountQuery(
+  adapter: FormatAdapter,
   alias: string,
   columns: Column[],
   filters: Record<string, FilterValue>,
 ): { sql: string; params: unknown[] } {
   const params: unknown[] = [];
   const where = buildWhereClause(columns, filters, params);
-  const sql = `SELECT COUNT(*) AS n FROM read_parquet(${quoteLiteral(alias)})${
+  const sql = `SELECT COUNT(*) AS n FROM ${adapter.fromExpr(alias)}${
     where ? ` WHERE ${where}` : ""
   }`;
   return { sql, params };

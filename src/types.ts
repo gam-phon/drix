@@ -1,3 +1,5 @@
+// Core, format-agnostic types. Anything parquet-specific lives in src/parquet/.
+
 export type DuckDBType =
   | { kind: "BOOLEAN" }
   | { kind: "INT"; bits: 8 | 16 | 32 | 64 | 128; signed: boolean }
@@ -18,51 +20,32 @@ export type DuckDBType =
   | { kind: "STRUCT"; fields: { name: string; type: DuckDBType }[] }
   | { kind: "UNKNOWN"; raw: string };
 
-export type ParquetMeta = {
-  // schema (parquet_schema)
-  physical?: string;
-  typeLength?: number;
-  repetition?: string;
-  convertedType?: string;
-  logicalType?: string;
-  precision?: number;
-  scale?: number;
-  fieldId?: number;
-  pathInSchema?: string[];
-  // storage (parquet_metadata, aggregated across row groups)
-  compression?: string;
-  encodings?: string;
-  totalCompressedSize?: number;
-  totalUncompressedSize?: number;
-  numValues?: number;
-  statsNullCount?: number;
-  statsDistinctCount?: number;
-  statsMin?: string;
-  statsMax?: string;
-  hasBloomFilter?: boolean;
-};
-
-export type ParquetFileInfo = {
-  numRows: number;
-  numRowGroups: number;
-  formatVersion?: string;
-  createdBy?: string;
-  encryptionAlgorithm?: string;
-  fileSizeBytes?: number;
-  kv: { key: string; value: string; binary: boolean }[];
-  rowGroups: {
-    id: number;
-    numRows: number;
-    totalByteSize: number;
-    compressedSize: number;
-  }[];
-};
-
+// Column-level metadata is format-specific. The format adapter fills `meta`
+// with its own shape (e.g. ParquetMeta); UI consumers cast at the use site.
 export type Column = {
   name: string;
   type: DuckDBType;
-  parquet?: ParquetMeta;
+  meta?: unknown;
 };
+
+// A FormatAdapter knows how to read one file format end-to-end: the SQL
+// reader function, the schema introspection (with format-specific column
+// metadata), and the file-level info shape rendered in the Info tab.
+//
+// Adding a new format = implement FormatAdapter and drop it into a new
+// `src/<format>/` folder; nothing in core needs to change.
+export interface FormatAdapter<FileInfo = unknown> {
+  /** machine identifier, e.g. "parquet" */
+  name: string;
+  /** lowercase extensions including dot, e.g. [".parquet"] */
+  extensions: string[];
+  /** SQL FROM-clause expression that reads this format from a registered alias */
+  fromExpr(alias: string): string;
+  /** fetch column list with format-specific metadata stuffed into Column.meta */
+  fetchSchema(alias: string): Promise<Column[]>;
+  /** fetch file-level info, or null if not supported by this adapter */
+  fetchFileInfo(alias: string, fileSizeBytes: number): Promise<FileInfo | null>;
+}
 
 export type FilterOp =
   | "eq"
@@ -92,6 +75,7 @@ export type Source = {
   columns: Column[];
   total: number;
   fileSizeBytes: number;
+  adapter: FormatAdapter;
 };
 
 export type Snippet = { name: string; sql: string };

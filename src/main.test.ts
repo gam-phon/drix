@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { formatCell, jsonReplacer } from "./format";
+import { parquetAdapter } from "./formats/parquet";
 import { parseDuckDBType, typeChipString } from "./parser";
 import { buildCountQuery, buildQuery, quoteIdent } from "./query";
 import type { Column } from "./types";
@@ -105,19 +106,45 @@ describe("parseDuckDBType nested", () => {
   });
 });
 
-describe("typeChipString", () => {
+describe("typeChipString (parquet labels)", () => {
   it("renders STRUCT", () => {
     expect(
       typeChipString({
         kind: "STRUCT",
         fields: [{ name: "a", type: { kind: "INT", bits: 32, signed: true } }],
       }),
-    ).toBe("STRUCT(a INTEGER)");
+    ).toBe("STRUCT<a: INT32>");
   });
-  it("renders LIST of BIGINT", () => {
+  it("renders LIST of INT64", () => {
     expect(typeChipString({ kind: "LIST", element: { kind: "INT", bits: 64, signed: true } })).toBe(
-      "BIGINT[]",
+      "LIST<INT64>",
     );
+  });
+  it("renders MAP", () => {
+    expect(
+      typeChipString({
+        kind: "MAP",
+        key: { kind: "VARCHAR" },
+        value: { kind: "INT", bits: 32, signed: true },
+      }),
+    ).toBe("MAP<STRING, INT32>");
+  });
+  it("renders signed and unsigned ints with bit width", () => {
+    expect(typeChipString({ kind: "INT", bits: 8, signed: true })).toBe("INT8");
+    expect(typeChipString({ kind: "INT", bits: 64, signed: false })).toBe("UINT64");
+  });
+  it("renders DECIMAL with precision and scale", () => {
+    expect(typeChipString({ kind: "DECIMAL", precision: 18, scale: 4 })).toBe("DECIMAL(18, 4)");
+  });
+  it("renders TIMESTAMP with unit and tz", () => {
+    expect(typeChipString({ kind: "TIMESTAMP", unit: "US", tz: false })).toBe("TIMESTAMP(MICROS)");
+    expect(typeChipString({ kind: "TIMESTAMP", unit: "MS", tz: true })).toBe(
+      "TIMESTAMP(MILLIS, UTC)",
+    );
+  });
+  it("renders VARCHAR as STRING and BLOB as BYTE_ARRAY", () => {
+    expect(typeChipString({ kind: "VARCHAR" })).toBe("STRING");
+    expect(typeChipString({ kind: "BLOB" })).toBe("BYTE_ARRAY");
   });
 });
 
@@ -131,6 +158,7 @@ describe("buildQuery", () => {
 
   it("builds a simple SELECT with LIMIT/OFFSET", () => {
     const { sql, params } = buildQuery({
+      adapter: parquetAdapter,
       alias: "data.parquet",
       columns: cols,
       visibility: visAll,
@@ -147,6 +175,7 @@ describe("buildQuery", () => {
 
   it("omits hidden columns", () => {
     const { sql } = buildQuery({
+      adapter: parquetAdapter,
       alias: "data.parquet",
       columns: cols,
       visibility: { id: true, label: false, price: true },
@@ -161,6 +190,7 @@ describe("buildQuery", () => {
 
   it("adds ORDER BY", () => {
     const { sql } = buildQuery({
+      adapter: parquetAdapter,
       alias: "data.parquet",
       columns: cols,
       visibility: visAll,
@@ -174,6 +204,7 @@ describe("buildQuery", () => {
 
   it("adds WHERE for contains (text)", () => {
     const { sql, params } = buildQuery({
+      adapter: parquetAdapter,
       alias: "data.parquet",
       columns: cols,
       visibility: visAll,
@@ -188,6 +219,7 @@ describe("buildQuery", () => {
 
   it("adds WHERE eq for numeric with cast", () => {
     const { sql, params } = buildQuery({
+      adapter: parquetAdapter,
       alias: "data.parquet",
       columns: cols,
       visibility: visAll,
@@ -202,6 +234,7 @@ describe("buildQuery", () => {
 
   it("adds BETWEEN", () => {
     const { sql, params } = buildQuery({
+      adapter: parquetAdapter,
       alias: "data.parquet",
       columns: cols,
       visibility: visAll,
@@ -216,6 +249,7 @@ describe("buildQuery", () => {
 
   it("paginates", () => {
     const { sql } = buildQuery({
+      adapter: parquetAdapter,
       alias: "data.parquet",
       columns: cols,
       visibility: visAll,
@@ -229,6 +263,7 @@ describe("buildQuery", () => {
 
   it("escapes single quotes in alias", () => {
     const { sql } = buildQuery({
+      adapter: parquetAdapter,
       alias: "weird's.parquet",
       columns: cols,
       visibility: visAll,
@@ -244,6 +279,7 @@ describe("buildQuery", () => {
 describe("buildCountQuery", () => {
   it("builds count with WHERE", () => {
     const { sql, params } = buildCountQuery(
+      parquetAdapter,
       "data.parquet",
       [{ name: "x", type: { kind: "INT", bits: 32, signed: true } }],
       { x: { op: "gt", v1: "5" } },

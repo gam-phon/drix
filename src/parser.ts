@@ -202,56 +202,57 @@ function unquoteIdent(s: string): string {
   return s;
 }
 
+// Renders the parquet-flavoured type label for a column. Uses logical-type
+// names (STRING, DECIMAL(p,s), TIMESTAMP(MICROS, UTC)) over DuckDB's
+// normalised names (VARCHAR, TIMESTAMPTZ) so the chip reflects what's
+// actually stored in the parquet file.
 export function typeChipString(t: DuckDBType): string {
   switch (t.kind) {
     case "BOOLEAN":
-      return "BOOL";
-    case "INT": {
-      const u = t.signed ? "" : "U";
-      const name =
-        t.bits === 8
-          ? "TINYINT"
-          : t.bits === 16
-            ? "SMALLINT"
-            : t.bits === 32
-              ? "INTEGER"
-              : t.bits === 64
-                ? "BIGINT"
-                : "HUGEINT";
-      return `${u}${name}`;
-    }
+      return "BOOLEAN";
+    case "INT":
+      return `${t.signed ? "INT" : "UINT"}${t.bits}`;
     case "FLOAT":
       return "FLOAT";
     case "DOUBLE":
       return "DOUBLE";
     case "DECIMAL":
-      return `DECIMAL(${t.precision},${t.scale})`;
+      return `DECIMAL(${t.precision}, ${t.scale})`;
     case "VARCHAR":
-      return "VARCHAR";
+      return "STRING";
     case "BLOB":
-      return "BLOB";
+      return "BYTE_ARRAY";
     case "UUID":
       return "UUID";
     case "JSON":
       return "JSON";
     case "DATE":
       return "DATE";
-    case "TIME":
-      return t.tz ? "TIMETZ" : "TIME";
+    case "TIME": {
+      const unit = "MICROS";
+      return t.tz ? `TIME(${unit}, UTC)` : `TIME(${unit})`;
+    }
     case "TIMESTAMP": {
-      const base = t.unit === "US" ? "TIMESTAMP" : `TIMESTAMP_${t.unit}`;
-      return t.tz ? `${base}TZ` : base;
+      const unit =
+        t.unit === "S"
+          ? "SECONDS"
+          : t.unit === "MS"
+            ? "MILLIS"
+            : t.unit === "NS"
+              ? "NANOS"
+              : "MICROS";
+      return t.tz ? `TIMESTAMP(${unit}, UTC)` : `TIMESTAMP(${unit})`;
     }
     case "INTERVAL":
       return "INTERVAL";
     case "ENUM":
       return "ENUM";
     case "LIST":
-      return `${typeChipString(t.element)}[]`;
+      return `LIST<${typeChipString(t.element)}>`;
     case "MAP":
-      return `MAP(${typeChipString(t.key)}, ${typeChipString(t.value)})`;
+      return `MAP<${typeChipString(t.key)}, ${typeChipString(t.value)}>`;
     case "STRUCT":
-      return `STRUCT(${t.fields.map((f) => `${f.name} ${typeChipString(f.type)}`).join(", ")})`;
+      return `STRUCT<${t.fields.map((f) => `${f.name}: ${typeChipString(f.type)}`).join(", ")}>`;
     default:
       return t.raw;
   }
