@@ -1,6 +1,7 @@
 import { type ColumnDef, flexRender, getCoreRowModel, useReactTable } from "@tanstack/react-table";
 import { type CSSProperties, type Dispatch, useEffect, useMemo, useState } from "react";
 import { formatBytes, formatCell, formatRatio, numberFmt } from "./format";
+import { CATEGORY_LIMIT, type Categories, fetchAllCategoricalColumns } from "./formats/parquet";
 import type { ParquetFileInfo, ParquetMeta } from "./formats/parquet/types";
 import { isFilterableSimple, typeChipString } from "./parser";
 import type {
@@ -1189,11 +1190,13 @@ export function SqlView({
 export function InfoView({ source }: { source: Source }) {
   const [info, setInfo] = useState<ParquetFileInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [categories, setCategories] = useState<Map<string, Categories>>(new Map());
 
   useEffect(() => {
     let cancelled = false;
     setInfo(null);
     setError(null);
+    setCategories(new Map());
     source.adapter
       .fetchFileInfo(source.alias, source.fileSizeBytes)
       .then((i) => {
@@ -1201,6 +1204,13 @@ export function InfoView({ source }: { source: Source }) {
       })
       .catch((e) => {
         if (!cancelled) setError((e as Error).message);
+      });
+    fetchAllCategoricalColumns(source.adapter, source.alias, source.columns)
+      .then((c) => {
+        if (!cancelled) setCategories(c);
+      })
+      .catch(() => {
+        // tooltip-only; ignore
       });
     return () => {
       cancelled = true;
@@ -1309,6 +1319,7 @@ export function InfoView({ source }: { source: Source }) {
               <tr style={{ color: "var(--fg-muted)", textAlign: "left" }}>
                 <Th>name</Th>
                 <Th>type</Th>
+                <Th>note</Th>
                 <Th align="right">values</Th>
                 <Th align="right">nulls</Th>
                 <Th align="right">distinct</Th>
@@ -1338,6 +1349,9 @@ export function InfoView({ source }: { source: Source }) {
                     </Td>
                     <Td>
                       <TypeChip type={c.type} noTooltip />
+                    </Td>
+                    <Td>
+                      <CategoricalNote categories={categories.get(c.name)} />
                     </Td>
                     <Td align="right">
                       {p.numValues != null ? numberFmt.format(p.numValues) : "—"}
@@ -1483,6 +1497,33 @@ export function InfoView({ source }: { source: Source }) {
 function shorten(s: string | undefined, max: number): string {
   if (!s) return "—";
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+// Renders a hint pill on STRING columns that look like enum / categorical:
+// dictionary-encoded with low cardinality. Hovering shows the actual values.
+function CategoricalNote({ categories }: { categories: Categories | undefined }) {
+  if (!categories) return <span style={{ color: "var(--fg-muted)" }}>—</span>;
+  const { values, truncated } = categories;
+  if (values.length === 0) return <span style={{ color: "var(--fg-muted)" }}>—</span>;
+  const preview = values.slice(0, 6).join(", ");
+  const tooltip = `Looks like enum / categorical (${values.length}${truncated ? "+" : ""} distinct values):\n${values.join(", ")}${truncated ? `\n… (showing first ${CATEGORY_LIMIT})` : ""}`;
+  return (
+    <span
+      title={tooltip}
+      style={{
+        background: "var(--chip-bg)",
+        color: "var(--chip-fg)",
+        padding: "1px 6px",
+        borderRadius: 999,
+        fontSize: 10,
+        cursor: "help",
+        whiteSpace: "nowrap",
+      }}
+    >
+      enum? {`{${values.length}${truncated ? "+" : ""}}`}{" "}
+      <span style={{ color: "var(--fg-muted)" }}>{shorten(preview, 32)}</span>
+    </span>
+  );
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {

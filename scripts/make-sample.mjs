@@ -1,45 +1,104 @@
 #!/usr/bin/env node
-// Generates ./sample.parquet covering all supported types.
-// Requires the `duckdb` CLI on PATH (https://duckdb.org/docs/installation/).
+// Generates ./sample.parquet covering every supported parquet type variation.
+// Self-contained: uses @duckdb/node-api (Node-native binding, devDep).
+// No external duckdb CLI required.
 
-import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
+import { DuckDBInstance } from "@duckdb/node-api";
 
-const sql = `
+const OUT = "sample.parquet";
+
+// DuckDB enums require an explicit CREATE TYPE before use.
+const CREATE_ENUM = `CREATE TYPE color AS ENUM ('red', 'green', 'blue');`;
+
+const COPY_SQL = `
 COPY (SELECT
-  range AS id,
-  (range % 2 = 0) AS flag,
-  range::TINYINT AS t8,
-  range::HUGEINT AS h,
-  (range / 3.0)::DOUBLE AS d,
-  (range::DECIMAL(18,4)) / 100 AS price,
-  ('row ' || range) AS label,
-  ENCODE('abc') AS bin,
-  DATE '2026-01-01' + range AS dt,
-  TIMESTAMP '2026-01-01' + INTERVAL (range) HOUR AS ts,
-  INTERVAL (range) DAY AS span,
-  uuid() AS uid,
-  [range, range + 1, range + 2] AS nums,
-  {'x': range, 'y': 'k' || range} AS obj,
-  MAP(['k'], [range]) AS m
+  /* ===== Integers (signed) ===== */
+  range                                AS id,        -- INT64 (BIGINT)
+  (range % 100)::TINYINT               AS i8,        -- INT8
+  (range % 30000)::SMALLINT            AS i16,       -- INT16
+  range::INTEGER                       AS i32,       -- INT32
+  range::BIGINT                        AS i64,       -- INT64
+  range::HUGEINT                       AS i128,      -- INT128 (HUGEINT)
+
+  /* ===== Integers (unsigned) ===== */
+  (range % 100)::UTINYINT              AS u8,        -- UINT8
+  (range % 30000)::USMALLINT           AS u16,       -- UINT16
+  range::UINTEGER                      AS u32,       -- UINT32
+  range::UBIGINT                       AS u64,       -- UINT64
+
+  /* ===== Floating point ===== */
+  (range / 7.0)::FLOAT                 AS f32,       -- FLOAT
+  (range / 3.0)::DOUBLE                AS f64,       -- DOUBLE
+
+  /* ===== Decimal ===== */
+  (range * 11)::DECIMAL(18,4)          AS dec18_4,   -- DECIMAL(18,4)
+
+  /* ===== Boolean ===== */
+  (range % 2 = 0)                      AS flag,      -- BOOLEAN
+
+  /* ===== Strings / bytes ===== */
+  CASE WHEN range % 50 = 0
+       THEN NULL
+       ELSE 'row ' || range
+  END                                  AS str,       -- STRING (with some NULLs)
+  ENCODE(repeat('ab', 1 + (range % 7)::INTEGER))
+                                       AS bin,       -- BYTE_ARRAY (variable size)
+  ('{"k":"v' || range || '","i":' || range || '}')::JSON
+                                       AS j,         -- JSON
+  uuid()                               AS uid,       -- UUID
+  (['red','green','blue'][1 + (range % 3)::INTEGER])::color
+                                       AS col,       -- ENUM
+
+  /* ===== Date / Time ===== */
+  (DATE '2026-01-01' + range::INTEGER)  AS dt,        -- DATE
+  (TIME '00:00:00' + INTERVAL ((range * 37) % 86400) SECOND)
+                                       AS t,         -- TIME
+  ((TIME '00:00:00' + INTERVAL ((range * 37) % 86400) SECOND)::TIMETZ)
+                                       AS t_tz,      -- TIMETZ
+
+  /* ===== Timestamp (every unit, with and without tz) ===== */
+  (TIMESTAMP '2026-01-01' + INTERVAL (range) HOUR)
+                                       AS ts_us,     -- TIMESTAMP(MICROS)
+  ((TIMESTAMP '2026-01-01' + INTERVAL (range) HOUR)::TIMESTAMP_S)
+                                       AS ts_s,      -- TIMESTAMP(SECONDS)
+  ((TIMESTAMP '2026-01-01' + INTERVAL (range) HOUR)::TIMESTAMP_MS)
+                                       AS ts_ms,     -- TIMESTAMP(MILLIS)
+  ((TIMESTAMP '2026-01-01' + INTERVAL (range) HOUR)::TIMESTAMP_NS)
+                                       AS ts_ns,     -- TIMESTAMP(NANOS)
+  ((TIMESTAMP '2026-01-01' + INTERVAL (range) HOUR)::TIMESTAMPTZ)
+                                       AS ts_tz,     -- TIMESTAMP(MICROS, UTC)
+
+  /* ===== Interval (months + days + microseconds, all varying) ===== */
+  (INTERVAL ((range % 12)) MONTH
+   + INTERVAL (1 + (range % 30)) DAY
+   + to_microseconds(((range * 1500) + 1000)::BIGINT))
+                                       AS span,      -- INTERVAL
+
+  /* ===== Nested ===== */
+  [range, range + 1, range + 2]        AS nums,      -- LIST<INT64>
+  {'x': range, 'y': 'k' || range, 'z': (range / 2.0)::DOUBLE}
+                                       AS obj,       -- STRUCT<x: INT64, y: STRING, z: DOUBLE>
+  MAP(['k' || range, 'k' || (range + 1)], [range, range + 1])
+                                       AS m          -- MAP<STRING, INT64>
+
 FROM range(1000))
-TO 'sample.parquet' (FORMAT PARQUET);
+TO '${OUT}' (FORMAT PARQUET);
 `;
 
-const which = spawnSync("which", ["duckdb"], { encoding: "utf8" });
-if (which.status !== 0) {
-  console.error("duckdb CLI not found on PATH. Install from https://duckdb.org/docs/installation/");
-  process.exit(1);
+if (existsSync(OUT)) rmSync(OUT);
+
+const instance = await DuckDBInstance.create(":memory:");
+const conn = await instance.connect();
+try {
+  await conn.run(CREATE_ENUM);
+  await conn.run(COPY_SQL);
+} finally {
+  conn.closeSync();
 }
 
-const res = spawnSync("duckdb", ["-c", sql], { stdio: "inherit" });
-if (res.status !== 0) {
-  console.error("duckdb invocation failed");
-  process.exit(res.status ?? 1);
-}
-
-if (!existsSync("sample.parquet")) {
-  console.error("sample.parquet was not created");
+if (!existsSync(OUT)) {
+  console.error(`failed: ${OUT} was not created`);
   process.exit(1);
 }
-console.log("Wrote sample.parquet");
+console.log(`Wrote ${OUT}`);
