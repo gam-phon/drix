@@ -1,5 +1,15 @@
 import { type ColumnDef, flexRender, getCoreRowModel, useReactTable } from "@tanstack/react-table";
-import { type CSSProperties, type Dispatch, useEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import {
+  type CSSProperties,
+  type Dispatch,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { formatBytes, formatRatio, numberFmt } from "./format";
 import {
   CATEGORY_LIMIT,
@@ -43,7 +53,13 @@ const sidebarHeading: CSSProperties = {
 // JSON tree
 // =========================================================================
 
-export function JsonTree({ value, depth = 0 }: { value: unknown; depth?: number }) {
+export const JsonTree = memo(function JsonTree({
+  value,
+  depth = 0,
+}: {
+  value: unknown;
+  depth?: number;
+}) {
   const [open, setOpen] = useState(depth < 2);
   if (value === null || value === undefined)
     return <span style={{ color: "var(--fg-muted)" }}>null</span>;
@@ -98,15 +114,23 @@ export function JsonTree({ value, depth = 0 }: { value: unknown; depth?: number 
     );
   }
   return <span>{String(value)}</span>;
-}
+});
 
 // =========================================================================
 // Cell view
 // =========================================================================
 
-function CellView({ value, type }: { value: unknown; type: ParquetType }) {
+const CellView = memo(function CellView({
+  value,
+  type,
+}: {
+  value: unknown;
+  type: ParquetType;
+}) {
   const [expanded, setExpanded] = useState(false);
-  const f = formatCell(value, type);
+  // formatCell can materialize Arrow proxies for nested types — cache the
+  // result so toggling `expanded` doesn't re-walk the proxy tree.
+  const f = useMemo(() => formatCell(value, type), [value, type]);
   if (f.display === "muted")
     return <span style={{ color: "var(--fg-muted)", fontStyle: "italic" }}>{f.text}</span>;
   if (f.display === "text") return <span>{f.text}</span>;
@@ -149,7 +173,7 @@ function CellView({ value, type }: { value: unknown; type: ParquetType }) {
       </span>
     </span>
   );
-}
+});
 
 // =========================================================================
 // Filter popover
@@ -294,7 +318,7 @@ function FilterPopover({
 // Type chip
 // =========================================================================
 
-function TypeChip({
+const TypeChip = memo(function TypeChip({
   type,
   parquet,
   noTooltip,
@@ -304,7 +328,7 @@ function TypeChip({
   noTooltip?: boolean;
 }) {
   const [hover, setHover] = useState(false);
-  const label = typeChipString(type);
+  const label = useMemo(() => typeChipString(type), [type]);
   return (
     <span
       onMouseEnter={() => !noTooltip && setHover(true)}
@@ -397,7 +421,7 @@ function TypeChip({
       )}
     </span>
   );
-}
+});
 
 // =========================================================================
 // Top bar
@@ -747,6 +771,54 @@ export function Sidebar({
 // Data grid
 // =========================================================================
 
+// Cell padding/border styling lifted to a constant so it stays referentially
+// equal across renders (avoids a new object identity per cell per render).
+const cellStyle: CSSProperties = {
+  borderBottom: "1px solid var(--border)",
+  borderRight: "1px solid var(--border)",
+  padding: "4px 8px",
+  verticalAlign: "top",
+  maxWidth: 400,
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+};
+
+// One row of the data grid. Memoized so j/k navigation only re-renders the
+// two affected rows (old + new selection), not the whole visible window. The
+// `onSelect` callback is stable across renders (the parent uses a ref) so
+// memo equality holds even as the parent's closure changes.
+type DataRowProps = {
+  row: ReturnType<
+    ReturnType<typeof useReactTable<Record<string, unknown>>>["getRowModel"]
+  >["rows"][number];
+  rowIdx: number;
+  isSelected: boolean;
+  isOdd: boolean;
+  onSelect: (idx: number, original: Record<string, unknown>) => void;
+};
+
+const DataRow = memo(function DataRow({ row, rowIdx, isSelected, isOdd, onSelect }: DataRowProps) {
+  const bg = isSelected ? "var(--row-selected)" : isOdd ? "var(--row-alt)" : "transparent";
+  return (
+    // biome-ignore lint/a11y/useKeyWithClickEvents: keyboard nav lives on the global window listener (j/k/Enter)
+    <tr
+      onClick={() => onSelect(rowIdx, row.original)}
+      style={{
+        cursor: "pointer",
+        background: bg,
+        outline: isSelected ? "2px solid var(--accent)" : undefined,
+        outlineOffset: isSelected ? "-2px" : undefined,
+      }}
+    >
+      {row.getVisibleCells().map((cell) => (
+        <td key={cell.id} style={cellStyle}>
+          {flexRender(cell.column.columnDef.cell, cell.getContext())}
+        </td>
+      ))}
+    </tr>
+  );
+});
+
 function DataGrid({
   columns,
   rows,
@@ -791,7 +863,8 @@ function DataGrid({
   });
 
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
-  const tableRef = useRef<HTMLTableElement | null>(null);
+  // Container that scrolls — used for virtualization and `scrollToIndex`.
+  const scrollRef = useRef<HTMLDivElement | null>(null);
   // Clear selection when the underlying data changes (page/sort/filter).
   // biome-ignore lint/correctness/useExhaustiveDependencies: rows reference is the trigger
   useEffect(() => {
@@ -800,82 +873,126 @@ function DataGrid({
   // Track 'gg' (two consecutive g presses).
   const lastKeyRef = useRef<{ key: string; t: number } | null>(null);
 
-  function moveSelection(delta: number, absolute?: number) {
-    setSelectedIdx((prev) => {
-      const total = rows.length;
-      if (total === 0) return null;
-      const start = prev ?? -1;
-      let next = absolute != null ? absolute : start + delta;
-      if (next < 0) next = 0;
-      if (next >= total) next = total - 1;
-      return next;
-    });
-  }
-
-  // Scroll the selected row into view whenever it changes.
+  // Stable identity for the row click handler so memoized DataRows don't bust.
+  // The latest `onRowClick` is always read through a ref.
+  const onRowClickRef = useRef(onRowClick);
   useEffect(() => {
-    if (selectedIdx == null || !tableRef.current) return;
-    const tr = tableRef.current.querySelector<HTMLTableRowElement>(
-      `tbody tr:nth-child(${selectedIdx + 1})`,
-    );
-    tr?.scrollIntoView({ block: "nearest" });
-  }, [selectedIdx]);
+    onRowClickRef.current = onRowClick;
+  }, [onRowClick]);
+  const onSelectStable = useCallback((idx: number, original: Record<string, unknown>) => {
+    setSelectedIdx(idx);
+    onRowClickRef.current(original);
+  }, []);
 
-  function handleGridKey(e: React.KeyboardEvent<HTMLTableElement>) {
-    const tag = (e.target as HTMLElement).tagName;
-    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
-    const key = e.key;
-    const ctrl = e.ctrlKey || e.metaKey;
-    const half = Math.max(1, Math.floor(rows.length / 2));
+  // TanStack rows array — referenced both by virtualizer and the row map.
+  const tableRows = table.getRowModel().rows;
 
-    if (key === "j" || key === "n") {
-      // `n` = next match. Because the grid only contains rows that match the
-      // active global filter, "next match" is the same as "next row".
-      e.preventDefault();
-      moveSelection(1);
-    } else if (key === "k" || key === "N") {
-      e.preventDefault();
-      moveSelection(-1);
-    } else if (key === "d" && ctrl) {
-      e.preventDefault();
-      moveSelection(half);
-    } else if (key === "u" && ctrl) {
-      e.preventDefault();
-      moveSelection(-half);
-    } else if (key === "G") {
-      e.preventDefault();
-      moveSelection(0, rows.length - 1);
-    } else if (key === "g") {
-      e.preventDefault();
-      const now = performance.now();
-      const last = lastKeyRef.current;
-      if (last && last.key === "g" && now - last.t < 500) {
-        moveSelection(0, 0);
-        lastKeyRef.current = null;
-      } else {
-        lastKeyRef.current = { key: "g", t: now };
-      }
-    } else if (key === "Enter") {
-      if (selectedIdx != null && rows[selectedIdx]) {
+  // Virtualize the body so a 500-row page only renders ~30 DOM rows. Big win
+  // for first-render time, scroll smoothness, and j/k navigation.
+  const rowVirtualizer = useVirtualizer({
+    count: tableRows.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => 28,
+    overscan: 12,
+  });
+  const virtualRows = rowVirtualizer.getVirtualItems();
+  const totalSize = rowVirtualizer.getTotalSize();
+  const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
+  const paddingBottom =
+    virtualRows.length > 0 ? totalSize - virtualRows[virtualRows.length - 1].end : 0;
+
+  // Scroll the selected row into view whenever it changes — virtualizer-aware.
+  useEffect(() => {
+    if (selectedIdx == null) return;
+    rowVirtualizer.scrollToIndex(selectedIdx, { align: "auto" });
+  }, [selectedIdx, rowVirtualizer]);
+
+  // Refs let the window listener stay attached for the whole DataGrid lifetime
+  // (no re-attach on every prop change) while still seeing fresh state.
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+  const selectedIdxRef = useRef(selectedIdx);
+  selectedIdxRef.current = selectedIdx;
+  const onOpenQuickFilterRef = useRef(onOpenQuickFilter);
+  onOpenQuickFilterRef.current = onOpenQuickFilter;
+
+  // Window-level vim navigation. Works without first focusing the table.
+  // Skips when typing in an input / textarea / contenteditable so it never
+  // eats characters from the SQL editor or filter inputs.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const t = e.target as HTMLElement | null;
+      const tag = t?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (t?.isContentEditable) return;
+
+      const key = e.key;
+      const ctrl = e.ctrlKey; // vim uses Ctrl-D / Ctrl-U; Cmd-D/U on Mac stay free for browser.
+      const currentRows = rowsRef.current;
+      const half = Math.max(1, Math.floor(currentRows.length / 2));
+      const moveBy = (delta: number, absolute?: number) => {
+        setSelectedIdx((prev) => {
+          const total = currentRows.length;
+          if (total === 0) return null;
+          const start = prev ?? -1;
+          let next = absolute != null ? absolute : start + delta;
+          if (next < 0) next = 0;
+          if (next >= total) next = total - 1;
+          return next;
+        });
+      };
+
+      if (key === "j") {
         e.preventDefault();
-        onRowClick(rows[selectedIdx]);
+        moveBy(1);
+      } else if (key === "k") {
+        e.preventDefault();
+        moveBy(-1);
+      } else if (key === "d" && ctrl) {
+        e.preventDefault();
+        moveBy(half);
+      } else if (key === "u" && ctrl) {
+        e.preventDefault();
+        moveBy(-half);
+      } else if (key === "G") {
+        e.preventDefault();
+        moveBy(0, currentRows.length - 1);
+      } else if (key === "g") {
+        e.preventDefault();
+        const now = performance.now();
+        const last = lastKeyRef.current;
+        if (last && last.key === "g" && now - last.t < 500) {
+          moveBy(0, 0);
+          lastKeyRef.current = null;
+        } else {
+          lastKeyRef.current = { key: "g", t: now };
+        }
+      } else if (key === "Enter") {
+        const idx = selectedIdxRef.current;
+        if (idx != null && currentRows[idx]) {
+          e.preventDefault();
+          onRowClickRef.current(currentRows[idx]);
+        }
+      } else if (key === "Escape") {
+        if (selectedIdxRef.current != null) {
+          e.preventDefault();
+          setSelectedIdx(null);
+        }
+      } else if (key === "/" && onOpenQuickFilterRef.current) {
+        e.preventDefault();
+        onOpenQuickFilterRef.current?.();
       }
-    } else if (key === "Escape") {
-      e.preventDefault();
-      setSelectedIdx(null);
-    } else if (key === "/" && onOpenQuickFilter) {
-      e.preventDefault();
-      onOpenQuickFilter();
     }
-  }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   return (
-    <div style={{ overflow: "auto", flex: 1, border: "1px solid var(--border)", borderRadius: 6 }}>
+    <div
+      ref={scrollRef}
+      style={{ overflow: "auto", flex: 1, border: "1px solid var(--border)", borderRadius: 6 }}
+    >
       <table
-        ref={tableRef}
-        // biome-ignore lint/a11y/noNoninteractiveTabindex: vim-style keyboard nav requires the table itself to receive focus
-        tabIndex={0}
-        onKeyDown={handleGridKey}
         style={{
           borderCollapse: "collapse",
           width: "100%",
@@ -965,7 +1082,7 @@ function DataGrid({
           ))}
         </thead>
         <tbody>
-          {table.getRowModel().rows.length === 0 ? (
+          {tableRows.length === 0 ? (
             <tr>
               <td
                 colSpan={columns.length}
@@ -975,47 +1092,31 @@ function DataGrid({
               </td>
             </tr>
           ) : (
-            table.getRowModel().rows.map((row, idx) => {
-              const isSelected = selectedIdx === idx;
-              const bg = isSelected
-                ? "var(--row-selected)"
-                : idx % 2 === 1
-                  ? "var(--row-alt)"
-                  : "transparent";
-              return (
-                // biome-ignore lint/a11y/useKeyWithClickEvents: keyboard nav lives on the table-level handler (j/k/Enter)
-                <tr
-                  key={row.id}
-                  onClick={() => {
-                    setSelectedIdx(idx);
-                    onRowClick(row.original);
-                  }}
-                  style={{
-                    cursor: "pointer",
-                    background: bg,
-                    outline: isSelected ? "2px solid var(--accent)" : undefined,
-                    outlineOffset: isSelected ? "-2px" : undefined,
-                  }}
-                >
-                  {row.getVisibleCells().map((cell) => (
-                    <td
-                      key={cell.id}
-                      style={{
-                        borderBottom: "1px solid var(--border)",
-                        borderRight: "1px solid var(--border)",
-                        padding: "4px 8px",
-                        verticalAlign: "top",
-                        maxWidth: 400,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                      }}
-                    >
-                      {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                    </td>
-                  ))}
+            <>
+              {paddingTop > 0 && (
+                <tr style={{ height: paddingTop }}>
+                  <td colSpan={columns.length} />
                 </tr>
-              );
-            })
+              )}
+              {virtualRows.map((vrow) => {
+                const row = tableRows[vrow.index];
+                return (
+                  <DataRow
+                    key={row.id}
+                    row={row}
+                    rowIdx={vrow.index}
+                    isSelected={selectedIdx === vrow.index}
+                    isOdd={vrow.index % 2 === 1}
+                    onSelect={onSelectStable}
+                  />
+                );
+              })}
+              {paddingBottom > 0 && (
+                <tr style={{ height: paddingBottom }}>
+                  <td colSpan={columns.length} />
+                </tr>
+              )}
+            </>
           )}
         </tbody>
       </table>
@@ -1227,7 +1328,56 @@ export function DataTab({
   openFilter: string | null;
   setOpenFilter: (s: string | null) => void;
 }) {
-  const visible = source.columns.filter((c) => state.visibility[c.name] !== false);
+  // Stable column slice — only changes when the source changes or a column's
+  // visibility flips. Keeps DataGrid's `colDefs` memo from busting on every
+  // render of this parent.
+  const visible = useMemo(
+    () => source.columns.filter((c) => state.visibility[c.name] !== false),
+    [source.columns, state.visibility],
+  );
+
+  // Always-fresh state via ref so the stable callbacks below can read the
+  // current `state.sort` without being themselves recreated on every render.
+  const sortRef = useRef(state.sort);
+  sortRef.current = state.sort;
+
+  const onSort = useCallback(
+    (id: string, multi: boolean) => {
+      const sort = sortRef.current;
+      const cur = sort.find((s) => s.id === id);
+      // Cycle for the clicked column: none → asc → desc → none
+      const cycled: SortEntry | null = !cur
+        ? { id, desc: false }
+        : cur.desc
+          ? null
+          : { id, desc: true };
+      const next = multi
+        ? cycled
+          ? [...sort.filter((s) => s.id !== id), cycled]
+          : sort.filter((s) => s.id !== id)
+        : cycled
+          ? [cycled]
+          : [];
+      dispatch({ type: "SET_SORT", sort: next });
+    },
+    [dispatch],
+  );
+  const onFilterChange = useCallback(
+    (col: string, v: FilterValue | undefined) =>
+      dispatch({ type: "SET_FILTER", column: col, value: v }),
+    [dispatch],
+  );
+  const onRowClick = useCallback(
+    (r: Record<string, unknown>) => dispatch({ type: "OPEN_DRAWER", row: r }),
+    [dispatch],
+  );
+  const onOpenQuickFilter = useCallback(() => dispatch({ type: "OPEN_QUICK_FILTER" }), [dispatch]);
+  const onPage = useCallback((p: number) => dispatch({ type: "SET_PAGE", page: p }), [dispatch]);
+  const onPageSize = useCallback(
+    (ps: number) => dispatch({ type: "SET_PAGE_SIZE", pageSize: ps }),
+    [dispatch],
+  );
+
   return (
     <div style={{ padding: 12, display: "flex", flexDirection: "column", gap: 8, height: "100%" }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
@@ -1257,37 +1407,19 @@ export function DataTab({
         rows={state.rows}
         sort={state.sort}
         filters={state.filters}
-        onSort={(id, multi) => {
-          const cur = state.sort.find((s) => s.id === id);
-          // Cycle for the clicked column: none → asc → desc → none
-          const cycled: SortEntry | null = !cur
-            ? { id, desc: false }
-            : cur.desc
-              ? null
-              : { id, desc: true };
-          let next: SortEntry[];
-          if (multi) {
-            // shift-click: keep other columns, replace/remove this one
-            const others = state.sort.filter((s) => s.id !== id);
-            next = cycled ? [...others, cycled] : others;
-          } else {
-            // plain click: only this column (or clear)
-            next = cycled ? [cycled] : [];
-          }
-          dispatch({ type: "SET_SORT", sort: next });
-        }}
-        onFilterChange={(col, v) => dispatch({ type: "SET_FILTER", column: col, value: v })}
+        onSort={onSort}
+        onFilterChange={onFilterChange}
         openFilter={openFilter}
         setOpenFilter={setOpenFilter}
-        onRowClick={(r) => dispatch({ type: "OPEN_DRAWER", row: r })}
-        onOpenQuickFilter={() => dispatch({ type: "OPEN_QUICK_FILTER" })}
+        onRowClick={onRowClick}
+        onOpenQuickFilter={onOpenQuickFilter}
       />
       <Pagination
         page={state.page}
         pageSize={state.pageSize}
         total={source.total}
-        onPage={(p) => dispatch({ type: "SET_PAGE", page: p })}
-        onPageSize={(ps) => dispatch({ type: "SET_PAGE_SIZE", pageSize: ps })}
+        onPage={onPage}
+        onPageSize={onPageSize}
       />
     </div>
   );
