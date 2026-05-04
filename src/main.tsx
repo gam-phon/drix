@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  CollapseHandle,
   DataTab,
   EmptyState,
   InfoView,
@@ -39,6 +40,7 @@ const initialState: State = {
   drawerRow: null,
   theme: "light",
   sidebarCollapsed: false,
+  drawerCollapsed: false,
   sqlText: "",
   sqlRows: [],
   sqlColumns: [],
@@ -82,6 +84,30 @@ function reducer(state: State, action: Action): State {
         globalFilter: "",
         quickFilterOpen: false,
         page: 0,
+      };
+    }
+    case "REMOVE_SOURCE": {
+      const sources = state.sources.filter((s) => s.alias !== action.alias);
+      const wasActive = state.activeAlias === action.alias;
+      if (!wasActive) {
+        return { ...state, sources };
+      }
+      // Active source was removed — switch to the first remaining one, or
+      // clear everything when no sources are left.
+      const next = sources[0] ?? null;
+      const visibility: Record<string, boolean> = {};
+      if (next) for (const c of next.columns) visibility[c.name] = true;
+      return {
+        ...state,
+        sources,
+        activeAlias: next?.alias ?? null,
+        visibility,
+        sort: [],
+        filters: {},
+        globalFilter: "",
+        quickFilterOpen: false,
+        page: 0,
+        rows: [],
       };
     }
     case "SET_TAB":
@@ -143,6 +169,8 @@ function reducer(state: State, action: Action): State {
       return { ...state, theme: action.theme };
     case "TOGGLE_SIDEBAR":
       return { ...state, sidebarCollapsed: !state.sidebarCollapsed };
+    case "TOGGLE_DRAWER":
+      return { ...state, drawerCollapsed: !state.drawerCollapsed };
     case "SET_SQL_TEXT":
       return { ...state, sqlText: action.text };
     case "SQL_RESULT":
@@ -208,6 +236,9 @@ function App() {
     if (localStorage.getItem("drix.sidebarCollapsed") === "1") {
       dispatch({ type: "TOGGLE_SIDEBAR" });
     }
+    if (localStorage.getItem("drix.drawerCollapsed") === "1") {
+      dispatch({ type: "TOGGLE_DRAWER" });
+    }
   }, []);
 
   useEffect(() => {
@@ -222,6 +253,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem("drix.sidebarCollapsed", state.sidebarCollapsed ? "1" : "0");
   }, [state.sidebarCollapsed]);
+
+  useEffect(() => {
+    localStorage.setItem("drix.drawerCollapsed", state.drawerCollapsed ? "1" : "0");
+  }, [state.drawerCollapsed]);
 
   const loadFile = useCallback(
     async (file: File) => {
@@ -485,13 +520,11 @@ function App() {
       {(state.loading || state.loadingStage) && <div className="drix-progress" />}
       <TopBar
         state={state}
-        onOpen={() => fileInputRef.current?.click()}
         onTabChange={(tab) => dispatch({ type: "SET_TAB", tab })}
         onTheme={() =>
           dispatch({ type: "SET_THEME", theme: state.theme === "dark" ? "light" : "dark" })
         }
         onExport={exportCsv}
-        onToggleSidebar={() => dispatch({ type: "TOGGLE_SIDEBAR" })}
       />
       <input
         ref={fileInputRef}
@@ -508,17 +541,40 @@ function App() {
         style={{
           display: "grid",
           gridTemplateColumns: (() => {
-            const sidebar = state.sidebarCollapsed ? "" : "240px ";
-            const drawer = state.tab === "info" ? "" : " 320px";
+            const sidebar = state.sidebarCollapsed ? "32px " : "240px ";
+            const drawer = state.tab === "info" ? "" : state.drawerCollapsed ? " 32px" : " 320px";
             return `${sidebar}1fr${drawer}`;
           })(),
           overflow: "hidden",
         }}
       >
-        {!state.sidebarCollapsed && (
+        {state.sidebarCollapsed ? (
+          <CollapseHandle
+            side="left"
+            onExpand={() => dispatch({ type: "TOGGLE_SIDEBAR" })}
+            extras={
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                title="Open .parquet"
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: "var(--fg-muted)",
+                  cursor: "pointer",
+                  padding: "4px 6px",
+                  fontSize: 14,
+                }}
+              >
+                +
+              </button>
+            }
+          />
+        ) : (
           <Sidebar
             state={state}
             dispatch={dispatch}
+            onOpen={() => fileInputRef.current?.click()}
             onShowFileInfo={(alias) => {
               dispatch({ type: "SET_ACTIVE", alias });
               dispatch({ type: "SET_TAB", tab: "info" });
@@ -546,13 +602,17 @@ function App() {
             <EmptyState loadingStage={state.loadingStage} />
           )}
         </main>
-        {state.tab !== "info" && (
-          <RowDrawer
-            row={state.drawerRow}
-            columns={state.tab === "data" ? (activeSource?.columns ?? []) : state.sqlColumns}
-            onClose={() => dispatch({ type: "OPEN_DRAWER", row: null })}
-          />
-        )}
+        {state.tab !== "info" &&
+          (state.drawerCollapsed ? (
+            <CollapseHandle side="right" onExpand={() => dispatch({ type: "TOGGLE_DRAWER" })} />
+          ) : (
+            <RowDrawer
+              row={state.drawerRow}
+              columns={state.tab === "data" ? (activeSource?.columns ?? []) : state.sqlColumns}
+              onClose={() => dispatch({ type: "OPEN_DRAWER", row: null })}
+              onCollapse={() => dispatch({ type: "TOGGLE_DRAWER" })}
+            />
+          ))}
       </div>
       <StatusBar state={state} />
     </div>

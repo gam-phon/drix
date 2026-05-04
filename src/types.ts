@@ -84,6 +84,7 @@ export type State = {
   drawerRow: Record<string, unknown> | null;
   theme: "light" | "dark";
   sidebarCollapsed: boolean;
+  drawerCollapsed: boolean;
   sqlText: string;
   sqlRows: Record<string, unknown>[];
   sqlColumns: Column[];
@@ -94,6 +95,7 @@ export type State = {
 
 export type Action =
   | { type: "ADD_SOURCE"; source: Source }
+  | { type: "REMOVE_SOURCE"; alias: string }
   | { type: "SET_ACTIVE"; alias: string }
   | { type: "SET_TAB"; tab: "data" | "sql" | "info" }
   | { type: "SET_PAGE"; page: number }
@@ -113,6 +115,7 @@ export type Action =
   | { type: "OPEN_DRAWER"; row: Record<string, unknown> | null }
   | { type: "SET_THEME"; theme: "light" | "dark" }
   | { type: "TOGGLE_SIDEBAR" }
+  | { type: "TOGGLE_DRAWER" }
   | { type: "SET_SQL_TEXT"; text: string }
   | {
       type: "SQL_RESULT";

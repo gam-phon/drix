@@ -405,18 +405,14 @@ function TypeChip({
 
 export function TopBar({
   state,
-  onOpen,
   onTabChange,
   onTheme,
   onExport,
-  onToggleSidebar,
 }: {
   state: State;
-  onOpen: () => void;
   onTabChange: (t: "data" | "sql" | "info") => void;
   onTheme: () => void;
   onExport: () => void;
-  onToggleSidebar: () => void;
 }) {
   return (
     <header
@@ -429,14 +425,6 @@ export function TopBar({
         background: "var(--bg-alt)",
       }}
     >
-      <button
-        type="button"
-        onClick={onToggleSidebar}
-        title={state.sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
-        style={{ padding: "2px 8px" }}
-      >
-        {state.sidebarCollapsed ? "▸" : "◂"}
-      </button>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <img src="/logo.svg" width={22} height={22} alt="Drix logo" />
         <div style={{ fontWeight: 700, fontSize: 16 }}>
@@ -444,9 +432,6 @@ export function TopBar({
           <span style={{ color: "var(--fg-muted)", fontWeight: 400, fontSize: 12 }}>parquet</span>
         </div>
       </div>
-      <button type="button" onClick={onOpen}>
-        + Open .parquet
-      </button>
       <div style={{ display: "flex", gap: 0, marginLeft: 12 }}>
         <button
           type="button"
@@ -531,16 +516,67 @@ export function TopBar({
 }
 
 // =========================================================================
+// Collapsed-panel handle
+// =========================================================================
+
+// Thin (32px) vertical strip rendered in place of the sidebar or row drawer
+// when the user collapses it. Click the chevron to expand. Optional `extras`
+// stack below (e.g. an Open-file shortcut on the sidebar side).
+export function CollapseHandle({
+  side,
+  onExpand,
+  extras,
+}: {
+  side: "left" | "right";
+  onExpand: () => void;
+  extras?: React.ReactNode;
+}) {
+  return (
+    <aside
+      style={{
+        background: "var(--bg-alt)",
+        borderRight: side === "left" ? "1px solid var(--border)" : undefined,
+        borderLeft: side === "right" ? "1px solid var(--border)" : undefined,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        gap: 6,
+        padding: "8px 0",
+      }}
+    >
+      <button
+        type="button"
+        onClick={onExpand}
+        title={side === "left" ? "Show sidebar" : "Show panel"}
+        style={{
+          background: "transparent",
+          border: "none",
+          color: "var(--fg-muted)",
+          cursor: "pointer",
+          padding: "4px 6px",
+          fontSize: 14,
+        }}
+      >
+        {side === "left" ? "▸" : "◂"}
+      </button>
+      {extras}
+    </aside>
+  );
+}
+
+// =========================================================================
 // Sidebar
 // =========================================================================
 
 export function Sidebar({
   state,
   dispatch,
+  onOpen,
   onShowFileInfo,
 }: {
   state: State;
   dispatch: Dispatch<Action>;
+  onOpen: () => void;
   onShowFileInfo: (alias: string) => void;
 }) {
   const active = state.sources.find((s) => s.alias === state.activeAlias);
@@ -555,8 +591,36 @@ export function Sidebar({
         gap: 12,
       }}
     >
+      <button type="button" onClick={onOpen} style={{ width: "100%" }}>
+        + Open .parquet
+      </button>
       <div>
-        <div style={sidebarHeading}>Sources</div>
+        <div
+          style={{
+            ...sidebarHeading,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <span>Sources</span>
+          <button
+            type="button"
+            onClick={() => dispatch({ type: "TOGGLE_SIDEBAR" })}
+            title="Hide sidebar"
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "var(--fg-muted)",
+              cursor: "pointer",
+              padding: "0 4px",
+              fontSize: 12,
+              lineHeight: 1,
+            }}
+          >
+            ◂
+          </button>
+        </div>
         {state.sources.length === 0 && (
           <div
             style={{
@@ -566,7 +630,7 @@ export function Sidebar({
               lineHeight: 1.5,
             }}
           >
-            Drop a <code>.parquet</code> here, or click <strong>+ Open</strong> in the toolbar.
+            Drop a <code>.parquet</code> here, or click <strong>+ Open .parquet</strong> above.
           </div>
         )}
         {state.sources.map((s) => (
@@ -615,6 +679,21 @@ export function Sidebar({
               }}
             >
               ⓘ
+            </button>
+            <button
+              type="button"
+              onClick={() => dispatch({ type: "REMOVE_SOURCE", alias: s.alias })}
+              title="Close file"
+              style={{
+                background: "transparent",
+                border: "none",
+                color: "var(--fg-muted)",
+                cursor: "pointer",
+                padding: "2px 6px",
+                fontSize: 12,
+              }}
+            >
+              ×
             </button>
           </div>
         ))}
@@ -1188,10 +1267,12 @@ export function RowDrawer({
   row,
   columns,
   onClose,
+  onCollapse,
 }: {
   row: Record<string, unknown> | null;
   columns: Column[];
   onClose: () => void;
+  onCollapse?: () => void;
 }) {
   useEffect(() => {
     function handler(e: KeyboardEvent) {
@@ -1214,8 +1295,26 @@ export function RowDrawer({
       <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
         <div style={{ ...sidebarHeading, padding: 0, flex: 1 }}>Row detail</div>
         {row && (
-          <button type="button" onClick={onClose}>
+          <button type="button" onClick={onClose} title="Clear selection">
             ×
+          </button>
+        )}
+        {onCollapse && (
+          <button
+            type="button"
+            onClick={onCollapse}
+            title="Hide panel"
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "var(--fg-muted)",
+              cursor: "pointer",
+              padding: "0 4px",
+              fontSize: 14,
+              lineHeight: 1,
+            }}
+          >
+            ▸
           </button>
         )}
       </div>
