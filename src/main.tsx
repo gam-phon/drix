@@ -28,13 +28,17 @@ const initialState: State = {
   pageSize: 100,
   sort: [],
   filters: {},
+  globalFilter: "",
+  quickFilterOpen: false,
   visibility: {},
   rows: [],
   queryMs: 0,
   loading: false,
+  loadingStage: null,
   error: null,
   drawerRow: null,
   theme: "light",
+  sidebarCollapsed: false,
   sqlText: "",
   sqlRows: [],
   sqlColumns: [],
@@ -59,6 +63,8 @@ function reducer(state: State, action: Action): State {
         visibility,
         sort: [],
         filters: {},
+        globalFilter: "",
+        quickFilterOpen: false,
         page: 0,
       };
     }
@@ -73,6 +79,8 @@ function reducer(state: State, action: Action): State {
         visibility,
         sort: [],
         filters: {},
+        globalFilter: "",
+        quickFilterOpen: false,
         page: 0,
       };
     }
@@ -90,6 +98,12 @@ function reducer(state: State, action: Action): State {
       else delete filters[action.column];
       return { ...state, filters, page: 0 };
     }
+    case "SET_GLOBAL_FILTER":
+      return { ...state, globalFilter: action.text, page: 0 };
+    case "OPEN_QUICK_FILTER":
+      return { ...state, quickFilterOpen: true };
+    case "CLOSE_QUICK_FILTER":
+      return { ...state, quickFilterOpen: false, globalFilter: "", page: 0 };
     case "SET_VISIBILITY":
       return {
         ...state,
@@ -114,13 +128,21 @@ function reducer(state: State, action: Action): State {
     case "QUERY_RESULT":
       return { ...state, rows: action.rows, queryMs: action.ms };
     case "SET_LOADING":
-      return { ...state, loading: action.loading };
+      return {
+        ...state,
+        loading: action.loading,
+        loadingStage: action.loading ? state.loadingStage : null,
+      };
+    case "SET_LOADING_STAGE":
+      return { ...state, loadingStage: action.stage };
     case "SET_ERROR":
       return { ...state, error: action.error };
     case "OPEN_DRAWER":
       return { ...state, drawerRow: action.row };
     case "SET_THEME":
       return { ...state, theme: action.theme };
+    case "TOGGLE_SIDEBAR":
+      return { ...state, sidebarCollapsed: !state.sidebarCollapsed };
     case "SET_SQL_TEXT":
       return { ...state, sqlText: action.text };
     case "SQL_RESULT":
@@ -183,6 +205,9 @@ function App() {
     } catch {
       // ignore
     }
+    if (localStorage.getItem("drix.sidebarCollapsed") === "1") {
+      dispatch({ type: "TOGGLE_SIDEBAR" });
+    }
   }, []);
 
   useEffect(() => {
@@ -193,6 +218,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem("drix.snippets", JSON.stringify(state.snippets));
   }, [state.snippets]);
+
+  useEffect(() => {
+    localStorage.setItem("drix.sidebarCollapsed", state.sidebarCollapsed ? "1" : "0");
+  }, [state.sidebarCollapsed]);
 
   const loadFile = useCallback(
     async (file: File) => {
@@ -206,11 +235,15 @@ function App() {
       dispatch({ type: "SET_LOADING", loading: true });
       dispatch({ type: "SET_ERROR", error: null });
       try {
+        dispatch({ type: "SET_LOADING_STAGE", stage: `Reading ${file.name}…` });
         const { db } = await getDB();
         const buf = new Uint8Array(await file.arrayBuffer());
         const alias = pickAlias(file, state.sources);
+        dispatch({ type: "SET_LOADING_STAGE", stage: "Registering with DuckDB…" });
         await db.registerFileBuffer(alias, buf);
+        dispatch({ type: "SET_LOADING_STAGE", stage: "Reading parquet schema…" });
         const columns = await adapter.fetchSchema(alias);
+        dispatch({ type: "SET_LOADING_STAGE", stage: "Counting rows…" });
         const total = await fetchTotal(adapter, alias, columns, {});
         dispatch({
           type: "ADD_SOURCE",
@@ -227,6 +260,7 @@ function App() {
         dispatch({ type: "SET_ERROR", error: (e as Error).message });
       } finally {
         dispatch({ type: "SET_LOADING", loading: false });
+        dispatch({ type: "SET_LOADING_STAGE", stage: null });
       }
     },
     [state.sources],
@@ -234,6 +268,7 @@ function App() {
 
   const activeSource = state.sources.find((s) => s.alias === state.activeAlias) ?? null;
   const debouncedFilters = useDebounced(state.filters, 250);
+  const debouncedGlobalFilter = useDebounced(state.globalFilter, 250);
 
   useEffect(() => {
     if (!activeSource) return;
@@ -248,6 +283,7 @@ function App() {
           visibility: state.visibility,
           sort: state.sort,
           filters: debouncedFilters,
+          globalFilter: debouncedGlobalFilter,
           page: state.page,
           pageSize: state.pageSize,
         });
@@ -265,7 +301,15 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeSource, state.visibility, state.sort, debouncedFilters, state.page, state.pageSize]);
+  }, [
+    activeSource,
+    state.visibility,
+    state.sort,
+    debouncedFilters,
+    debouncedGlobalFilter,
+    state.page,
+    state.pageSize,
+  ]);
 
   useEffect(() => {
     if (!activeSource) return;
@@ -277,6 +321,7 @@ function App() {
           activeSource.alias,
           activeSource.columns,
           debouncedFilters,
+          debouncedGlobalFilter,
         );
         if (!cancelled) dispatch({ type: "SET_TOTAL", alias: activeSource.alias, total });
       } catch {
@@ -286,7 +331,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeSource, debouncedFilters]);
+  }, [activeSource, debouncedFilters, debouncedGlobalFilter]);
 
   const runSql = useCallback(async () => {
     const text = state.sqlText.trim();
@@ -370,7 +415,8 @@ function App() {
     <div
       style={{
         display: "grid",
-        gridTemplateRows: "auto 1fr auto",
+        gridTemplateRows:
+          state.loading || state.loadingStage ? "auto auto 1fr auto" : "auto 1fr auto",
         height: "100vh",
         background: "var(--bg)",
         color: "var(--fg)",
@@ -436,6 +482,7 @@ function App() {
           Drop .parquet to open
         </div>
       )}
+      {(state.loading || state.loadingStage) && <div className="drix-progress" />}
       <TopBar
         state={state}
         onOpen={() => fileInputRef.current?.click()}
@@ -444,6 +491,7 @@ function App() {
           dispatch({ type: "SET_THEME", theme: state.theme === "dark" ? "light" : "dark" })
         }
         onExport={exportCsv}
+        onToggleSidebar={() => dispatch({ type: "TOGGLE_SIDEBAR" })}
       />
       <input
         ref={fileInputRef}
@@ -459,19 +507,24 @@ function App() {
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: state.tab === "info" ? "240px 1fr" : "240px 1fr 320px",
+          gridTemplateColumns: (() => {
+            const sidebar = state.sidebarCollapsed ? "" : "240px ";
+            const drawer = state.tab === "info" ? "" : " 320px";
+            return `${sidebar}1fr${drawer}`;
+          })(),
           overflow: "hidden",
         }}
       >
-        <Sidebar
-          state={state}
-          dispatch={dispatch}
-          onOpen={() => fileInputRef.current?.click()}
-          onShowFileInfo={(alias) => {
-            dispatch({ type: "SET_ACTIVE", alias });
-            dispatch({ type: "SET_TAB", tab: "info" });
-          }}
-        />
+        {!state.sidebarCollapsed && (
+          <Sidebar
+            state={state}
+            dispatch={dispatch}
+            onShowFileInfo={(alias) => {
+              dispatch({ type: "SET_ACTIVE", alias });
+              dispatch({ type: "SET_TAB", tab: "info" });
+            }}
+          />
+        )}
         <main style={{ overflow: "auto", borderLeft: "1px solid var(--border)" }}>
           {state.tab === "data" ? (
             activeSource ? (
@@ -483,14 +536,14 @@ function App() {
                 setOpenFilter={setOpenFilter}
               />
             ) : (
-              <EmptyState onOpen={() => fileInputRef.current?.click()} />
+              <EmptyState loadingStage={state.loadingStage} />
             )
           ) : state.tab === "sql" ? (
             <SqlView state={state} dispatch={dispatch} runSql={runSql} />
           ) : activeSource ? (
             <InfoView source={activeSource} />
           ) : (
-            <EmptyState onOpen={() => fileInputRef.current?.click()} />
+            <EmptyState loadingStage={state.loadingStage} />
           )}
         </main>
         {state.tab !== "info" && (

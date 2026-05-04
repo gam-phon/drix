@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="public/logo.svg" width="80" alt="Drix logo" />
+</p>
+
 # Drix Viewer
 
 **Peek at your parquet files in the browser. No upload, no backend, no fuss.**
@@ -13,6 +17,10 @@ Drix is a static single-page app for inspecting `.parquet` files locally — sor
 Most parquet viewers either ship the file to a server, or pull every row into the JS heap and choke at a few hundred thousand rows. Drix takes a different approach: it registers your file as a virtual file inside an in-browser DuckDB instance, then **pushes every sort, filter, and paginate down to SQL**. The grid only ever holds the page you're looking at — so a 50-million-row file feels the same as a 50-row file.
 
 It's a focused tool: **parquet only**. No CSV, no JSON, no Excel — just a deep, well-built viewer for the format that actually matters when you're working with columnar data.
+
+### Why "Drix"?
+
+**`Dr`** for *drill in* — every column, every row group, every page-statistic is a tap away. **`ix`** for the data-flavoured suffix you find in *matrix*, *index*, *suffix*.
 
 ## Features
 
@@ -104,17 +112,6 @@ Then drop `sample.parquet` onto the page.
 5. Pagination always issues `LIMIT pageSize OFFSET page*pageSize`; the row-count query reuses the same WHERE clause and is memoized on the filter signature.
 
 The codebase is intentionally compact — every code path you'd want to read is one or two file-jumps away.
-
-## Deploying
-
-Drix deploys to **Cloudflare Workers + Static Assets**:
-
-- `wrangler.toml` declares `[assets] directory = "./dist"` and `not_found_handling = "single-page-application"` for SPA routing.
-- The Cloudflare Workers Builds connector watches the GitHub repo: every push to `main` runs `npm run build` then `npx wrangler deploy`.
-- The DuckDB WASM engine (~75 MB across mvp/eh) is fetched from jsDelivr at runtime, not bundled — so the deployed app stays well under Cloudflare's 25 MB per-file limit.
-- `public/_headers` sets `Cache-Control: public, max-age=31536000, immutable` for the hashed `/assets/*` files.
-
-GitHub Actions runs lint + typecheck + tests + build on every PR. Cloudflare handles deployment independently.
 
 ## Tradeoffs / non-goals
 

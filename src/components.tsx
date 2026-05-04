@@ -1,5 +1,5 @@
 import { type ColumnDef, flexRender, getCoreRowModel, useReactTable } from "@tanstack/react-table";
-import { type CSSProperties, type Dispatch, useEffect, useMemo, useState } from "react";
+import { type CSSProperties, type Dispatch, useEffect, useMemo, useRef, useState } from "react";
 import { formatBytes, formatRatio, numberFmt } from "./format";
 import {
   CATEGORY_LIMIT,
@@ -409,12 +409,14 @@ export function TopBar({
   onTabChange,
   onTheme,
   onExport,
+  onToggleSidebar,
 }: {
   state: State;
   onOpen: () => void;
   onTabChange: (t: "data" | "sql" | "info") => void;
   onTheme: () => void;
   onExport: () => void;
+  onToggleSidebar: () => void;
 }) {
   return (
     <header
@@ -427,9 +429,20 @@ export function TopBar({
         background: "var(--bg-alt)",
       }}
     >
-      <div style={{ fontWeight: 700, fontSize: 16 }}>
-        Drix Viewer{" "}
-        <span style={{ color: "var(--fg-muted)", fontWeight: 400, fontSize: 12 }}>parquet</span>
+      <button
+        type="button"
+        onClick={onToggleSidebar}
+        title={state.sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
+        style={{ padding: "2px 8px" }}
+      >
+        {state.sidebarCollapsed ? "▸" : "◂"}
+      </button>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <img src="/logo.svg" width={22} height={22} alt="Drix logo" />
+        <div style={{ fontWeight: 700, fontSize: 16 }}>
+          Drix Viewer{" "}
+          <span style={{ color: "var(--fg-muted)", fontWeight: 400, fontSize: 12 }}>parquet</span>
+        </div>
       </div>
       <button type="button" onClick={onOpen}>
         + Open .parquet
@@ -467,6 +480,52 @@ export function TopBar({
       <button type="button" onClick={onExport} disabled={!state.activeAlias}>
         Export CSV
       </button>
+      <span
+        aria-hidden="true"
+        style={{
+          width: 1,
+          height: 18,
+          background: "var(--border)",
+          margin: "0 2px",
+        }}
+      />
+      <a
+        href="https://github.com/gam-phon"
+        target="_blank"
+        rel="noopener noreferrer"
+        title="Author"
+        style={{
+          color: "var(--fg-muted)",
+          textDecoration: "none",
+          fontSize: 12,
+        }}
+      >
+        by Yaser Alraddadi
+      </a>
+      <a
+        href="https://github.com/gam-phon/drix"
+        target="_blank"
+        rel="noopener noreferrer"
+        title="Source on GitHub"
+        aria-label="Source on GitHub"
+        style={{
+          color: "var(--fg-muted)",
+          display: "inline-flex",
+          alignItems: "center",
+        }}
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="20"
+          height="20"
+          viewBox="0 0 24 24"
+          fill="currentColor"
+          role="img"
+        >
+          <title>GitHub</title>
+          <path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.4 3-.405 1.02.005 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12" />
+        </svg>
+      </a>
     </header>
   );
 }
@@ -478,12 +537,10 @@ export function TopBar({
 export function Sidebar({
   state,
   dispatch,
-  onOpen,
   onShowFileInfo,
 }: {
   state: State;
   dispatch: Dispatch<Action>;
-  onOpen: () => void;
   onShowFileInfo: (alias: string) => void;
 }) {
   const active = state.sources.find((s) => s.alias === state.activeAlias);
@@ -501,10 +558,15 @@ export function Sidebar({
       <div>
         <div style={sidebarHeading}>Sources</div>
         {state.sources.length === 0 && (
-          <div style={{ color: "var(--fg-muted)", fontSize: 12, padding: "4px 6px" }}>
-            <button type="button" onClick={onOpen}>
-              Open a parquet
-            </button>
+          <div
+            style={{
+              color: "var(--fg-muted)",
+              fontSize: 11,
+              padding: "4px 6px",
+              lineHeight: 1.5,
+            }}
+          >
+            Drop a <code>.parquet</code> here, or click <strong>+ Open</strong> in the toolbar.
           </div>
         )}
         {state.sources.map((s) => (
@@ -618,6 +680,7 @@ function DataGrid({
   openFilter,
   setOpenFilter,
   onRowClick,
+  onOpenQuickFilter,
 }: {
   columns: Column[];
   rows: Record<string, unknown>[];
@@ -628,6 +691,7 @@ function DataGrid({
   openFilter: string | null;
   setOpenFilter: (s: string | null) => void;
   onRowClick: (r: Record<string, unknown>) => void;
+  onOpenQuickFilter?: () => void;
 }) {
   const colDefs = useMemo<ColumnDef<Record<string, unknown>>[]>(
     () =>
@@ -649,16 +713,97 @@ function DataGrid({
     manualFiltering: true,
   });
 
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  // Clear selection when the underlying data changes (page/sort/filter)
+  const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
+  const tableRef = useRef<HTMLTableElement | null>(null);
+  // Clear selection when the underlying data changes (page/sort/filter).
   // biome-ignore lint/correctness/useExhaustiveDependencies: rows reference is the trigger
   useEffect(() => {
-    setSelectedId(null);
+    setSelectedIdx(null);
   }, [rows]);
+  // Track 'gg' (two consecutive g presses).
+  const lastKeyRef = useRef<{ key: string; t: number } | null>(null);
+
+  function moveSelection(delta: number, absolute?: number) {
+    setSelectedIdx((prev) => {
+      const total = rows.length;
+      if (total === 0) return null;
+      const start = prev ?? -1;
+      let next = absolute != null ? absolute : start + delta;
+      if (next < 0) next = 0;
+      if (next >= total) next = total - 1;
+      return next;
+    });
+  }
+
+  // Scroll the selected row into view whenever it changes.
+  useEffect(() => {
+    if (selectedIdx == null || !tableRef.current) return;
+    const tr = tableRef.current.querySelector<HTMLTableRowElement>(
+      `tbody tr:nth-child(${selectedIdx + 1})`,
+    );
+    tr?.scrollIntoView({ block: "nearest" });
+  }, [selectedIdx]);
+
+  function handleGridKey(e: React.KeyboardEvent<HTMLTableElement>) {
+    const tag = (e.target as HTMLElement).tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    const key = e.key;
+    const ctrl = e.ctrlKey || e.metaKey;
+    const half = Math.max(1, Math.floor(rows.length / 2));
+
+    if (key === "j") {
+      e.preventDefault();
+      moveSelection(1);
+    } else if (key === "k") {
+      e.preventDefault();
+      moveSelection(-1);
+    } else if (key === "d" && ctrl) {
+      e.preventDefault();
+      moveSelection(half);
+    } else if (key === "u" && ctrl) {
+      e.preventDefault();
+      moveSelection(-half);
+    } else if (key === "G") {
+      e.preventDefault();
+      moveSelection(0, rows.length - 1);
+    } else if (key === "g") {
+      e.preventDefault();
+      const now = performance.now();
+      const last = lastKeyRef.current;
+      if (last && last.key === "g" && now - last.t < 500) {
+        moveSelection(0, 0);
+        lastKeyRef.current = null;
+      } else {
+        lastKeyRef.current = { key: "g", t: now };
+      }
+    } else if (key === "Enter") {
+      if (selectedIdx != null && rows[selectedIdx]) {
+        e.preventDefault();
+        onRowClick(rows[selectedIdx]);
+      }
+    } else if (key === "Escape") {
+      e.preventDefault();
+      setSelectedIdx(null);
+    } else if (key === "/" && onOpenQuickFilter) {
+      e.preventDefault();
+      onOpenQuickFilter();
+    }
+  }
 
   return (
     <div style={{ overflow: "auto", flex: 1, border: "1px solid var(--border)", borderRadius: 6 }}>
-      <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 12 }}>
+      <table
+        ref={tableRef}
+        // biome-ignore lint/a11y/noNoninteractiveTabindex: vim-style keyboard nav requires the table itself to receive focus
+        tabIndex={0}
+        onKeyDown={handleGridKey}
+        style={{
+          borderCollapse: "collapse",
+          width: "100%",
+          fontSize: 12,
+          outline: "none",
+        }}
+      >
         <thead style={{ position: "sticky", top: 0, background: "var(--bg-alt)", zIndex: 1 }}>
           {table.getHeaderGroups().map((hg) => (
             <tr key={hg.id}>
@@ -752,28 +897,26 @@ function DataGrid({
             </tr>
           ) : (
             table.getRowModel().rows.map((row, idx) => {
-              const isSelected = selectedId === row.id;
+              const isSelected = selectedIdx === idx;
               const bg = isSelected
                 ? "var(--row-selected)"
                 : idx % 2 === 1
                   ? "var(--row-alt)"
                   : "transparent";
               return (
+                // biome-ignore lint/a11y/useKeyWithClickEvents: keyboard nav lives on the table-level handler (j/k/Enter)
                 <tr
                   key={row.id}
                   onClick={() => {
-                    setSelectedId(row.id);
+                    setSelectedIdx(idx);
                     onRowClick(row.original);
                   }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      setSelectedId(row.id);
-                      onRowClick(row.original);
-                    }
+                  style={{
+                    cursor: "pointer",
+                    background: bg,
+                    outline: isSelected ? "2px solid var(--accent)" : undefined,
+                    outlineOffset: isSelected ? "-2px" : undefined,
                   }}
-                  tabIndex={0}
-                  style={{ cursor: "pointer", background: bg }}
                 >
                   {row.getVisibleCells().map((cell) => (
                     <td
@@ -869,6 +1012,60 @@ function Pagination({
 }
 
 // =========================================================================
+// Quick-filter (vim `/`)
+// =========================================================================
+
+function QuickFilter({
+  value,
+  onChange,
+  onClose,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  onClose: () => void;
+}) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        padding: "4px 8px",
+        background: "var(--bg-alt)",
+        border: "1px solid var(--accent)",
+        borderRadius: 6,
+      }}
+    >
+      <span style={{ fontFamily: "var(--mono)", color: "var(--accent)", fontWeight: 600 }}>/</span>
+      <input
+        ref={inputRef}
+        type="text"
+        placeholder="search across all text columns…"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            onClose();
+          } else if (e.key === "Enter") {
+            e.preventDefault();
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+        style={{ flex: 1, fontFamily: "var(--mono)", fontSize: 12 }}
+      />
+      <button type="button" onClick={onClose} title="Close (Esc)">
+        ×
+      </button>
+    </div>
+  );
+}
+
+// =========================================================================
 // Data view
 // =========================================================================
 
@@ -894,6 +1091,13 @@ export function DataTab({
           {numberFmt.format(source.total)} rows
         </span>
       </div>
+      {state.quickFilterOpen && (
+        <QuickFilter
+          value={state.globalFilter}
+          onChange={(text) => dispatch({ type: "SET_GLOBAL_FILTER", text })}
+          onClose={() => dispatch({ type: "CLOSE_QUICK_FILTER" })}
+        />
+      )}
       <DataGrid
         columns={visible}
         rows={state.rows}
@@ -922,6 +1126,7 @@ export function DataTab({
         openFilter={openFilter}
         setOpenFilter={setOpenFilter}
         onRowClick={(r) => dispatch({ type: "OPEN_DRAWER", row: r })}
+        onOpenQuickFilter={() => dispatch({ type: "OPEN_QUICK_FILTER" })}
       />
       <Pagination
         page={state.page}
@@ -934,7 +1139,25 @@ export function DataTab({
   );
 }
 
-export function EmptyState({ onOpen }: { onOpen: () => void }) {
+export function EmptyState({ loadingStage }: { loadingStage?: string | null }) {
+  if (loadingStage) {
+    return (
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          height: "100%",
+          flexDirection: "column",
+          gap: 16,
+          color: "var(--fg-muted)",
+        }}
+      >
+        <div className="drix-spinner" aria-hidden="true" />
+        <div style={{ fontSize: 14 }}>{loadingStage}</div>
+      </div>
+    );
+  }
   return (
     <div
       style={{
@@ -943,14 +1166,16 @@ export function EmptyState({ onOpen }: { onOpen: () => void }) {
         justifyContent: "center",
         height: "100%",
         flexDirection: "column",
-        gap: 12,
+        gap: 8,
         color: "var(--fg-muted)",
       }}
     >
-      <div style={{ fontSize: 16 }}>Drop a .parquet file here</div>
-      <button type="button" className="primary" onClick={onOpen}>
-        Open .parquet
-      </button>
+      <div style={{ fontSize: 16 }}>
+        Drop a <code>.parquet</code> file here
+      </div>
+      <div style={{ fontSize: 12 }}>
+        or click <strong>+ Open .parquet</strong> in the toolbar.
+      </div>
     </div>
   );
 }
@@ -1634,7 +1859,8 @@ function Td({ children, align }: { children: React.ReactNode; align?: "right" })
 
 export function StatusBar({ state }: { state: State }) {
   let text: React.ReactNode = "ready";
-  if (state.loading) text = "loading…";
+  if (state.loadingStage) text = state.loadingStage;
+  else if (state.loading) text = "loading…";
   else if (state.error) text = <span style={{ color: "var(--danger)" }}>{state.error}</span>;
   else if (state.tab === "data" && state.rows.length > 0)
     text = `query ${state.queryMs.toFixed(1)} ms · ${state.rows.length} rows shown`;

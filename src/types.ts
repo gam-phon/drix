@@ -73,13 +73,17 @@ export type State = {
   pageSize: number;
   sort: SortEntry[];
   filters: Record<string, FilterValue>;
+  globalFilter: string;
+  quickFilterOpen: boolean;
   visibility: Record<string, boolean>;
   rows: Record<string, unknown>[];
   queryMs: number;
   loading: boolean;
+  loadingStage: string | null;
   error: string | null;
   drawerRow: Record<string, unknown> | null;
   theme: "light" | "dark";
+  sidebarCollapsed: boolean;
   sqlText: string;
   sqlRows: Record<string, unknown>[];
   sqlColumns: Column[];
@@ -96,14 +100,19 @@ export type Action =
   | { type: "SET_PAGE_SIZE"; pageSize: number }
   | { type: "SET_SORT"; sort: SortEntry[] }
   | { type: "SET_FILTER"; column: string; value: FilterValue | undefined }
+  | { type: "SET_GLOBAL_FILTER"; text: string }
+  | { type: "OPEN_QUICK_FILTER" }
+  | { type: "CLOSE_QUICK_FILTER" }
   | { type: "SET_VISIBILITY"; column: string; visible: boolean }
   | { type: "SHOW_ALL_COLUMNS" }
   | { type: "SET_TOTAL"; alias: string; total: number }
   | { type: "QUERY_RESULT"; rows: Record<string, unknown>[]; ms: number }
   | { type: "SET_LOADING"; loading: boolean }
+  | { type: "SET_LOADING_STAGE"; stage: string | null }
   | { type: "SET_ERROR"; error: string | null }
   | { type: "OPEN_DRAWER"; row: Record<string, unknown> | null }
   | { type: "SET_THEME"; theme: "light" | "dark" }
+  | { type: "TOGGLE_SIDEBAR" }
   | { type: "SET_SQL_TEXT"; text: string }
   | {
       type: "SQL_RESULT";

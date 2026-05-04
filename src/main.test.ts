@@ -294,6 +294,70 @@ describe("buildCountQuery", () => {
   });
 });
 
+describe("buildQuery — global filter (vim `/`)", () => {
+  const cols: Column[] = [
+    { name: "id", type: { kind: "INT", bits: 64, signed: true } },
+    { name: "label", type: { kind: "STRING" } },
+    { name: "tag", type: { kind: "ENUM" } },
+    { name: "uid", type: { kind: "UUID" } },
+    { name: "price", type: { kind: "DECIMAL", precision: 18, scale: 4 } },
+  ];
+  const visAll = { id: true, label: true, tag: true, uid: true, price: true };
+
+  it("OR-joins ILIKE across every text-ish column, skips numeric", () => {
+    const { sql, params } = buildQuery({
+      adapter: parquetAdapter,
+      alias: "data.parquet",
+      columns: cols,
+      visibility: visAll,
+      sort: [],
+      filters: {},
+      globalFilter: "abc",
+      page: 0,
+      pageSize: 10,
+    });
+    expect(sql).toContain(
+      `WHERE (CAST("label" AS VARCHAR) ILIKE ? OR CAST("tag" AS VARCHAR) ILIKE ? OR CAST("uid" AS VARCHAR) ILIKE ?)`,
+    );
+    // 3 placeholders, all bound to the same %abc% pattern.
+    expect(params).toEqual(["%abc%", "%abc%", "%abc%"]);
+  });
+
+  it("combines per-column filter with global filter via AND", () => {
+    const { sql, params } = buildQuery({
+      adapter: parquetAdapter,
+      alias: "data.parquet",
+      columns: cols,
+      visibility: visAll,
+      sort: [],
+      filters: { id: { op: "eq", v1: "42" } },
+      globalFilter: "foo",
+      page: 0,
+      pageSize: 10,
+    });
+    expect(sql).toContain(
+      `WHERE "id" = CAST(? AS BIGINT) AND (CAST("label" AS VARCHAR) ILIKE ? OR CAST("tag" AS VARCHAR) ILIKE ? OR CAST("uid" AS VARCHAR) ILIKE ?)`,
+    );
+    expect(params).toEqual(["42", "%foo%", "%foo%", "%foo%"]);
+  });
+
+  it("ignores blank/whitespace global filter", () => {
+    const { sql, params } = buildQuery({
+      adapter: parquetAdapter,
+      alias: "data.parquet",
+      columns: cols,
+      visibility: visAll,
+      sort: [],
+      filters: {},
+      globalFilter: "   ",
+      page: 0,
+      pageSize: 10,
+    });
+    expect(sql).not.toContain("WHERE");
+    expect(params).toEqual([]);
+  });
+});
+
 describe("formatCell", () => {
   it("formats null as muted NULL", () => {
     const r = formatCell(null, { kind: "STRING" });

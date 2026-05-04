@@ -53,8 +53,9 @@ export async function fetchTotal(
   alias: string,
   columns: Column[],
   filters: Record<string, FilterValue>,
+  globalFilter?: string,
 ) {
-  const { sql, params } = buildCountQuery(adapter, alias, columns, filters);
+  const { sql, params } = buildCountQuery(adapter, alias, columns, filters, globalFilter);
   const { result } = await runQuery(sql, params);
   const rows = result.toArray() as Array<{ n: bigint | number }>;
   const n = rows[0]?.n;

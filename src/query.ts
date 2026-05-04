@@ -16,16 +16,17 @@ export type BuildQueryArgs = {
   visibility: Record<string, boolean>;
   sort: SortEntry[];
   filters: Record<string, FilterValue>;
+  globalFilter?: string;
   page: number;
   pageSize: number;
 };
 
 export function buildQuery(args: BuildQueryArgs): { sql: string; params: unknown[] } {
-  const { adapter, alias, columns, visibility, sort, filters, page, pageSize } = args;
+  const { adapter, alias, columns, visibility, sort, filters, globalFilter, page, pageSize } = args;
   const params: unknown[] = [];
   const visible = columns.filter((c) => visibility[c.name] !== false);
   const select = visible.length > 0 ? visible.map((c) => quoteIdent(c.name)).join(", ") : "*";
-  const where = buildWhereClause(columns, filters, params);
+  const where = buildWhereClause(columns, filters, params, globalFilter);
   const order =
     sort.length > 0
       ? `ORDER BY ${sort
@@ -46,19 +47,24 @@ export function buildCountQuery(
   alias: string,
   columns: Column[],
   filters: Record<string, FilterValue>,
+  globalFilter?: string,
 ): { sql: string; params: unknown[] } {
   const params: unknown[] = [];
-  const where = buildWhereClause(columns, filters, params);
+  const where = buildWhereClause(columns, filters, params, globalFilter);
   const sql = `SELECT COUNT(*) AS n FROM ${adapter.fromExpr(alias)}${
     where ? ` WHERE ${where}` : ""
   }`;
   return { sql, params };
 }
 
+// Text-ish parquet kinds the global filter searches across.
+const GLOBAL_FILTER_KINDS = new Set(["STRING", "ENUM", "JSON", "UUID"]);
+
 export function buildWhereClause(
   columns: Column[],
   filters: Record<string, FilterValue>,
   params: unknown[],
+  globalFilter?: string,
 ): string {
   const clauses: string[] = [];
   for (const col of columns) {
@@ -106,5 +112,18 @@ export function buildWhereClause(
       }
     }
   }
+
+  // Global filter: ILIKE across every text-ish column, OR'd. Triggered by `/`.
+  const trimmed = globalFilter?.trim();
+  if (trimmed) {
+    const textCols = columns.filter((c) => GLOBAL_FILTER_KINDS.has(c.type.kind));
+    if (textCols.length > 0) {
+      const ors = textCols.map((c) => `CAST(${quoteIdent(c.name)} AS VARCHAR) ILIKE ?`);
+      clauses.push(`(${ors.join(" OR ")})`);
+      const pat = `%${trimmed}%`;
+      for (let i = 0; i < textCols.length; i++) params.push(pat);
+    }
+  }
+
   return clauses.join(" AND ");
 }
