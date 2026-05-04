@@ -7,5 +7,7 @@ export {
   isCategoricalCandidate,
 } from "./categories";
 export { fetchParquetFileInfo } from "./file-info";
+export { type FormatResult, formatCell } from "./format";
+export { castExpr, isFilterableSimple, parseParquetType, typeChipString } from "./parser";
 export { fetchParquetSchema } from "./schema";
-export type { ParquetFileInfo, ParquetMeta } from "./types";
+export type { ParquetFileInfo, ParquetMeta, ParquetType } from "./types";

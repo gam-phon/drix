@@ -1,4 +1,4 @@
-import { castExpr } from "./parser";
+import { castExpr } from "./formats/parquet/parser";
 import type { Column, FilterValue, FormatAdapter, SortEntry } from "./types";
 
 export function quoteIdent(name: string): string {

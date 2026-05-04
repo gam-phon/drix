@@ -1,7 +1,7 @@
 import { runQuery } from "../../duckdb";
-import { parseDuckDBType } from "../../parser";
 import { quoteLiteral } from "../../query";
 import type { Column } from "../../types";
+import { parseParquetType } from "./parser";
 import type { ParquetMeta } from "./types";
 
 function asNumber(v: unknown): number | undefined {
@@ -19,7 +19,7 @@ export async function fetchParquetSchema(alias: string): Promise<Column[]> {
   const descRows = descResult.toArray() as Array<{ column_name: string; column_type: string }>;
   const columns: Column[] = descRows.map((r) => ({
     name: r.column_name,
-    type: parseDuckDBType(r.column_type),
+    type: parseParquetType(r.column_type),
   }));
 
   const byName: Record<string, ParquetMeta> = {};

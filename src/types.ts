@@ -1,30 +1,15 @@
-// Core, format-agnostic types. Anything parquet-specific lives in src/parquet/.
+// Core types. Drix is parquet-only today; Column.type uses ParquetType (lives
+// in src/formats/parquet/types.ts). When a second format is added, switch
+// Column to a discriminated union or generic over the format's type model.
+import type { ParquetType } from "./formats/parquet/types";
 
-export type DuckDBType =
-  | { kind: "BOOLEAN" }
-  | { kind: "INT"; bits: 8 | 16 | 32 | 64 | 128; signed: boolean }
-  | { kind: "FLOAT" }
-  | { kind: "DOUBLE" }
-  | { kind: "DECIMAL"; precision: number; scale: number }
-  | { kind: "VARCHAR" }
-  | { kind: "BLOB" }
-  | { kind: "UUID" }
-  | { kind: "JSON" }
-  | { kind: "DATE" }
-  | { kind: "TIME"; tz: boolean }
-  | { kind: "TIMESTAMP"; unit: "S" | "MS" | "US" | "NS"; tz: boolean }
-  | { kind: "INTERVAL" }
-  | { kind: "ENUM"; values?: string[] }
-  | { kind: "LIST"; element: DuckDBType }
-  | { kind: "MAP"; key: DuckDBType; value: DuckDBType }
-  | { kind: "STRUCT"; fields: { name: string; type: DuckDBType }[] }
-  | { kind: "UNKNOWN"; raw: string };
+export type { ParquetType };
 
 // Column-level metadata is format-specific. The format adapter fills `meta`
 // with its own shape (e.g. ParquetMeta); UI consumers cast at the use site.
 export type Column = {
   name: string;
-  type: DuckDBType;
+  type: ParquetType;
   meta?: unknown;
 };
 
@@ -79,12 +64,6 @@ export type Source = {
 };
 
 export type Snippet = { name: string; sql: string };
-
-export type FormatResult =
-  | { display: "text"; text: string }
-  | { display: "muted"; text: string }
-  | { display: "tree"; preview: string; value: unknown }
-  | { display: "blob"; bytes: Uint8Array };
 
 export type State = {
   sources: Source[];

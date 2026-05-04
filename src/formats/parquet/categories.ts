@@ -12,7 +12,7 @@ import type { ParquetMeta } from "./types";
 export const CATEGORY_LIMIT = 50;
 
 export function isCategoricalCandidate(col: Column): boolean {
-  if (col.type.kind !== "VARCHAR" && col.type.kind !== "ENUM") return false;
+  if (col.type.kind !== "STRING" && col.type.kind !== "ENUM") return false;
   const m = col.meta as ParquetMeta | undefined;
   if (!m) return false;
   const hasDict = m.encodings?.includes("DICTIONARY") ?? false;

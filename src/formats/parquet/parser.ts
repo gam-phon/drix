@@ -1,11 +1,20 @@
-import type { DuckDBType } from "./types";
+import type { ParquetType } from "./types";
 
-export function parseDuckDBType(input: string): DuckDBType {
+// Parse a DuckDB-flavoured type string (the form returned by `DESCRIBE`,
+// e.g. "BIGINT", "STRUCT(a INTEGER, b VARCHAR)", "TIMESTAMPTZ") and emit a
+// parquet-flavoured ParquetType. We keep this DuckDB-aware because the SQL
+// tab and DESCRIBE on a parquet source both hand us DuckDB type strings —
+// only the *output* model is parquet.
+//
+// For loaded parquet files, prefer the richer parquet_schema-based parser in
+// src/formats/parquet/schema.ts which has access to physical/logical/converted
+// types directly.
+export function parseParquetType(input: string): ParquetType {
   const s = input.trim();
 
   // LIST: trailing [] (check first so STRUCT(...)[] works)
   if (s.endsWith("[]")) {
-    return { kind: "LIST", element: parseDuckDBType(s.slice(0, -2).trim()) };
+    return { kind: "LIST", element: parseParquetType(s.slice(0, -2).trim()) };
   }
 
   const upper = s.toUpperCase();
@@ -17,7 +26,7 @@ export function parseDuckDBType(input: string): DuckDBType {
       const space = findFirstTopLevelSpace(p);
       if (space < 0) throw new Error(`Bad struct field: ${p}`);
       const name = unquoteIdent(p.slice(0, space).trim());
-      const type = parseDuckDBType(p.slice(space + 1).trim());
+      const type = parseParquetType(p.slice(space + 1).trim());
       return { name, type };
     });
     return { kind: "STRUCT", fields };
@@ -29,8 +38,8 @@ export function parseDuckDBType(input: string): DuckDBType {
     if (parts.length !== 2) throw new Error(`Bad map: ${s}`);
     return {
       kind: "MAP",
-      key: parseDuckDBType(parts[0]),
-      value: parseDuckDBType(parts[1]),
+      key: parseParquetType(parts[0]),
+      value: parseParquetType(parts[1]),
     };
   }
 
@@ -92,12 +101,12 @@ export function parseDuckDBType(input: string): DuckDBType {
     case "TEXT":
     case "STRING":
     case "CHAR":
-      return { kind: "VARCHAR" };
+      return { kind: "STRING" };
     case "BLOB":
     case "BYTEA":
     case "BINARY":
     case "VARBINARY":
-      return { kind: "BLOB" };
+      return { kind: "BYTE_ARRAY" };
     case "UUID":
       return { kind: "UUID" };
     case "JSON":
@@ -105,22 +114,23 @@ export function parseDuckDBType(input: string): DuckDBType {
     case "DATE":
       return { kind: "DATE" };
     case "TIME":
-      return { kind: "TIME", tz: false };
+      return { kind: "TIME", unit: "MICROS", adjustedToUTC: false };
     case "TIME WITH TIME ZONE":
     case "TIMETZ":
-      return { kind: "TIME", tz: true };
+      return { kind: "TIME", unit: "MICROS", adjustedToUTC: true };
     case "TIMESTAMP":
     case "DATETIME":
-      return { kind: "TIMESTAMP", unit: "US", tz: false };
+      return { kind: "TIMESTAMP", unit: "MICROS", adjustedToUTC: false };
     case "TIMESTAMP_S":
-      return { kind: "TIMESTAMP", unit: "S", tz: false };
+      // Parquet has no second precision; round up to MICROS.
+      return { kind: "TIMESTAMP", unit: "MICROS", adjustedToUTC: false };
     case "TIMESTAMP_MS":
-      return { kind: "TIMESTAMP", unit: "MS", tz: false };
+      return { kind: "TIMESTAMP", unit: "MILLIS", adjustedToUTC: false };
     case "TIMESTAMP_NS":
-      return { kind: "TIMESTAMP", unit: "NS", tz: false };
+      return { kind: "TIMESTAMP", unit: "NANOS", adjustedToUTC: false };
     case "TIMESTAMP WITH TIME ZONE":
     case "TIMESTAMPTZ":
-      return { kind: "TIMESTAMP", unit: "US", tz: true };
+      return { kind: "TIMESTAMP", unit: "MICROS", adjustedToUTC: true };
     case "INTERVAL":
       return { kind: "INTERVAL" };
     default:
@@ -202,47 +212,41 @@ function unquoteIdent(s: string): string {
   return s;
 }
 
-// Renders the parquet-flavoured type label for a column. Uses logical-type
-// names (STRING, DECIMAL(p,s), TIMESTAMP(MICROS, UTC)) over DuckDB's
-// normalised names (VARCHAR, TIMESTAMPTZ) so the chip reflects what's
-// actually stored in the parquet file.
-export function typeChipString(t: DuckDBType): string {
+// Renders the parquet-flavoured type label for a column.
+export function typeChipString(t: ParquetType): string {
   switch (t.kind) {
     case "BOOLEAN":
       return "BOOLEAN";
     case "INT":
       return `${t.signed ? "INT" : "UINT"}${t.bits}`;
+    case "INT96":
+      return "INT96";
     case "FLOAT":
       return "FLOAT";
+    case "FLOAT16":
+      return "FLOAT16";
     case "DOUBLE":
       return "DOUBLE";
     case "DECIMAL":
       return `DECIMAL(${t.precision}, ${t.scale})`;
-    case "VARCHAR":
+    case "STRING":
       return "STRING";
-    case "BLOB":
+    case "BYTE_ARRAY":
       return "BYTE_ARRAY";
+    case "FIXED_LEN_BYTE_ARRAY":
+      return `FIXED_LEN_BYTE_ARRAY(${t.length})`;
     case "UUID":
       return "UUID";
     case "JSON":
       return "JSON";
+    case "BSON":
+      return "BSON";
     case "DATE":
       return "DATE";
-    case "TIME": {
-      const unit = "MICROS";
-      return t.tz ? `TIME(${unit}, UTC)` : `TIME(${unit})`;
-    }
-    case "TIMESTAMP": {
-      const unit =
-        t.unit === "S"
-          ? "SECONDS"
-          : t.unit === "MS"
-            ? "MILLIS"
-            : t.unit === "NS"
-              ? "NANOS"
-              : "MICROS";
-      return t.tz ? `TIMESTAMP(${unit}, UTC)` : `TIMESTAMP(${unit})`;
-    }
+    case "TIME":
+      return t.adjustedToUTC ? `TIME(${t.unit}, UTC)` : `TIME(${t.unit})`;
+    case "TIMESTAMP":
+      return t.adjustedToUTC ? `TIMESTAMP(${t.unit}, UTC)` : `TIMESTAMP(${t.unit})`;
     case "INTERVAL":
       return "INTERVAL";
     case "ENUM":
@@ -258,12 +262,15 @@ export function typeChipString(t: DuckDBType): string {
   }
 }
 
-export function isFilterableSimple(t: DuckDBType): boolean {
+export function isFilterableSimple(t: ParquetType): boolean {
   switch (t.kind) {
     case "LIST":
     case "MAP":
     case "STRUCT":
-    case "BLOB":
+    case "BYTE_ARRAY":
+    case "FIXED_LEN_BYTE_ARRAY":
+    case "INT96":
+    case "BSON":
     case "UNKNOWN":
       return false;
     default:
@@ -271,15 +278,25 @@ export function isFilterableSimple(t: DuckDBType): boolean {
   }
 }
 
-export function castExpr(t: DuckDBType): string | null {
+// Maps a ParquetType to a DuckDB-flavoured CAST target for filter predicate
+// generation. SQL is still executed by DuckDB so we hand it back its own
+// type names (BIGINT not INT64, VARCHAR not STRING, etc.).
+export function castExpr(t: ParquetType): string | null {
   switch (t.kind) {
     case "DATE":
       return "DATE";
     case "TIME":
-      return t.tz ? "TIMETZ" : "TIME";
+      return t.adjustedToUTC ? "TIMETZ" : "TIME";
     case "TIMESTAMP": {
-      const base = t.unit === "US" ? "TIMESTAMP" : `TIMESTAMP_${t.unit}`;
-      return t.tz ? `${base}TZ` : base;
+      if (t.adjustedToUTC) return "TIMESTAMPTZ";
+      switch (t.unit) {
+        case "MILLIS":
+          return "TIMESTAMP_MS";
+        case "NANOS":
+          return "TIMESTAMP_NS";
+        default:
+          return "TIMESTAMP";
+      }
     }
     case "DECIMAL":
       return `DECIMAL(${t.precision},${t.scale})`;
@@ -307,6 +324,10 @@ export function castExpr(t: DuckDBType): string | null {
       return "INTERVAL";
     case "UUID":
       return "UUID";
+    case "STRING":
+      return "VARCHAR";
+    case "JSON":
+      return "JSON";
     default:
       return null;
   }

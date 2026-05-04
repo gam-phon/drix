@@ -12,7 +12,7 @@ import {
 } from "./components";
 import { fetchTotal, getDB, runQuery } from "./duckdb";
 import { parquetAdapter } from "./formats/parquet";
-import { parseDuckDBType } from "./parser";
+import { parseParquetType } from "./formats/parquet/parser";
 import { buildQuery, buildWhereClause, quoteIdent } from "./query";
 import type { Action, Column, Source, State } from "./types";
 
@@ -294,10 +294,27 @@ function App() {
     try {
       const { result, ms } = await runQuery(text);
       const rows = result.toArray() as Record<string, unknown>[];
-      const columns: Column[] = result.schema.fields.map((f) => ({
-        name: f.name,
-        type: parseDuckDBType(String(f.type)),
-      }));
+      // Get DuckDB-flavoured column types via DESCRIBE so the chips match the
+      // Data tab. Fall back to Arrow's stringified field types if DESCRIBE
+      // can't be applied (e.g. for non-SELECT statements).
+      let columns: Column[];
+      try {
+        const stripped = text.replace(/;\s*$/, "");
+        const desc = await runQuery(`DESCRIBE ${stripped}`);
+        const descRows = desc.result.toArray() as Array<{
+          column_name: string;
+          column_type: string;
+        }>;
+        columns = descRows.map((r) => ({
+          name: r.column_name,
+          type: parseParquetType(r.column_type),
+        }));
+      } catch {
+        columns = result.schema.fields.map((f) => ({
+          name: f.name,
+          type: parseParquetType(String(f.type)),
+        }));
+      }
       dispatch({ type: "SQL_RESULT", rows, columns, ms, error: null });
     } catch (e) {
       dispatch({

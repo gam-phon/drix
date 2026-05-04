@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { formatCell, jsonReplacer } from "./format";
-import { parquetAdapter } from "./formats/parquet";
-import { parseDuckDBType, typeChipString } from "./parser";
+import { jsonReplacer } from "./format";
+import { formatCell, parquetAdapter, parseParquetType, typeChipString } from "./formats/parquet";
 import { buildCountQuery, buildQuery, quoteIdent } from "./query";
 import type { Column } from "./types";
 
@@ -14,76 +13,79 @@ describe("quoteIdent", () => {
   });
 });
 
-describe("parseDuckDBType primitives", () => {
+describe("parseParquetType primitives", () => {
   it("parses BIGINT", () => {
-    expect(parseDuckDBType("BIGINT")).toEqual({ kind: "INT", bits: 64, signed: true });
+    expect(parseParquetType("BIGINT")).toEqual({ kind: "INT", bits: 64, signed: true });
   });
   it("parses UBIGINT", () => {
-    expect(parseDuckDBType("UBIGINT")).toEqual({ kind: "INT", bits: 64, signed: false });
+    expect(parseParquetType("UBIGINT")).toEqual({ kind: "INT", bits: 64, signed: false });
   });
   it("parses HUGEINT", () => {
-    expect(parseDuckDBType("HUGEINT")).toEqual({ kind: "INT", bits: 128, signed: true });
+    expect(parseParquetType("HUGEINT")).toEqual({ kind: "INT", bits: 128, signed: true });
   });
   it("parses TINYINT", () => {
-    expect(parseDuckDBType("TINYINT")).toEqual({ kind: "INT", bits: 8, signed: true });
+    expect(parseParquetType("TINYINT")).toEqual({ kind: "INT", bits: 8, signed: true });
   });
-  it("parses VARCHAR", () => {
-    expect(parseDuckDBType("VARCHAR")).toEqual({ kind: "VARCHAR" });
+  it("parses VARCHAR as STRING", () => {
+    expect(parseParquetType("VARCHAR")).toEqual({ kind: "STRING" });
+  });
+  it("parses BLOB as BYTE_ARRAY", () => {
+    expect(parseParquetType("BLOB")).toEqual({ kind: "BYTE_ARRAY" });
   });
   it("parses DECIMAL with precision/scale", () => {
-    expect(parseDuckDBType("DECIMAL(18,4)")).toEqual({
+    expect(parseParquetType("DECIMAL(18,4)")).toEqual({
       kind: "DECIMAL",
       precision: 18,
       scale: 4,
     });
   });
   it("parses TIMESTAMP_MS", () => {
-    expect(parseDuckDBType("TIMESTAMP_MS")).toEqual({
+    expect(parseParquetType("TIMESTAMP_MS")).toEqual({
       kind: "TIMESTAMP",
-      unit: "MS",
-      tz: false,
+      unit: "MILLIS",
+      adjustedToUTC: false,
     });
   });
   it("parses TIMESTAMPTZ", () => {
-    expect(parseDuckDBType("TIMESTAMPTZ")).toEqual({
+    expect(parseParquetType("TIMESTAMPTZ")).toEqual({
       kind: "TIMESTAMP",
-      unit: "US",
-      tz: true,
+      unit: "MICROS",
+      adjustedToUTC: true,
     });
   });
   it("parses DATE", () => {
-    expect(parseDuckDBType("DATE")).toEqual({ kind: "DATE" });
+    expect(parseParquetType("DATE")).toEqual({ kind: "DATE" });
   });
   it("parses BOOLEAN", () => {
-    expect(parseDuckDBType("BOOLEAN")).toEqual({ kind: "BOOLEAN" });
+    expect(parseParquetType("BOOLEAN")).toEqual({ kind: "BOOLEAN" });
   });
 });
 
-describe("parseDuckDBType nested", () => {
+describe("parseParquetType nested", () => {
   it("parses LIST as []", () => {
-    expect(parseDuckDBType("INTEGER[]")).toEqual({
+    expect(parseParquetType("INTEGER[]")).toEqual({
       kind: "LIST",
       element: { kind: "INT", bits: 32, signed: true },
     });
   });
   it("parses MAP", () => {
-    expect(parseDuckDBType("MAP(VARCHAR, INTEGER)")).toEqual({
+    expect(parseParquetType("MAP(VARCHAR, INTEGER)")).toEqual({
       kind: "MAP",
-      key: { kind: "VARCHAR" },
+      key: { kind: "STRING" },
       value: { kind: "INT", bits: 32, signed: true },
     });
   });
   it("parses STRUCT", () => {
-    expect(parseDuckDBType("STRUCT(a INTEGER, b VARCHAR)")).toEqual({
+    expect(parseParquetType("STRUCT(a INTEGER, b VARCHAR)")).toEqual({
       kind: "STRUCT",
       fields: [
         { name: "a", type: { kind: "INT", bits: 32, signed: true } },
-        { name: "b", type: { kind: "VARCHAR" } },
+        { name: "b", type: { kind: "STRING" } },
       ],
     });
   });
   it("parses STRUCT containing LIST", () => {
-    const t = parseDuckDBType("STRUCT(xs INTEGER[], y VARCHAR)");
+    const t = parseParquetType("STRUCT(xs INTEGER[], y VARCHAR)");
     expect(t).toEqual({
       kind: "STRUCT",
       fields: [
@@ -91,12 +93,12 @@ describe("parseDuckDBType nested", () => {
           name: "xs",
           type: { kind: "LIST", element: { kind: "INT", bits: 32, signed: true } },
         },
-        { name: "y", type: { kind: "VARCHAR" } },
+        { name: "y", type: { kind: "STRING" } },
       ],
     });
   });
   it("parses LIST of STRUCT", () => {
-    expect(parseDuckDBType("STRUCT(a INTEGER)[]")).toEqual({
+    expect(parseParquetType("STRUCT(a INTEGER)[]")).toEqual({
       kind: "LIST",
       element: {
         kind: "STRUCT",
@@ -124,7 +126,7 @@ describe("typeChipString (parquet labels)", () => {
     expect(
       typeChipString({
         kind: "MAP",
-        key: { kind: "VARCHAR" },
+        key: { kind: "STRING" },
         value: { kind: "INT", bits: 32, signed: true },
       }),
     ).toBe("MAP<STRING, INT32>");
@@ -137,21 +139,23 @@ describe("typeChipString (parquet labels)", () => {
     expect(typeChipString({ kind: "DECIMAL", precision: 18, scale: 4 })).toBe("DECIMAL(18, 4)");
   });
   it("renders TIMESTAMP with unit and tz", () => {
-    expect(typeChipString({ kind: "TIMESTAMP", unit: "US", tz: false })).toBe("TIMESTAMP(MICROS)");
-    expect(typeChipString({ kind: "TIMESTAMP", unit: "MS", tz: true })).toBe(
+    expect(typeChipString({ kind: "TIMESTAMP", unit: "MICROS", adjustedToUTC: false })).toBe(
+      "TIMESTAMP(MICROS)",
+    );
+    expect(typeChipString({ kind: "TIMESTAMP", unit: "MILLIS", adjustedToUTC: true })).toBe(
       "TIMESTAMP(MILLIS, UTC)",
     );
   });
-  it("renders VARCHAR as STRING and BLOB as BYTE_ARRAY", () => {
-    expect(typeChipString({ kind: "VARCHAR" })).toBe("STRING");
-    expect(typeChipString({ kind: "BLOB" })).toBe("BYTE_ARRAY");
+  it("renders STRING and BYTE_ARRAY", () => {
+    expect(typeChipString({ kind: "STRING" })).toBe("STRING");
+    expect(typeChipString({ kind: "BYTE_ARRAY" })).toBe("BYTE_ARRAY");
   });
 });
 
 describe("buildQuery", () => {
   const cols: Column[] = [
     { name: "id", type: { kind: "INT", bits: 64, signed: true } },
-    { name: "label", type: { kind: "VARCHAR" } },
+    { name: "label", type: { kind: "STRING" } },
     { name: "price", type: { kind: "DECIMAL", precision: 18, scale: 4 } },
   ];
   const visAll = { id: true, label: true, price: true };
@@ -292,7 +296,7 @@ describe("buildCountQuery", () => {
 
 describe("formatCell", () => {
   it("formats null as muted NULL", () => {
-    const r = formatCell(null, { kind: "VARCHAR" });
+    const r = formatCell(null, { kind: "STRING" });
     expect(r).toEqual({ display: "muted", text: "NULL" });
   });
   it("formats bigint INT64 as toString", () => {
@@ -339,7 +343,7 @@ describe("formatCell", () => {
   });
   it("truncates very long strings", () => {
     const long = "x".repeat(500);
-    const r = formatCell(long, { kind: "VARCHAR" });
+    const r = formatCell(long, { kind: "STRING" });
     expect(r.display === "text" && r.text.endsWith("…")).toBe(true);
   });
 });

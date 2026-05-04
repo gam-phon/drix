@@ -1,19 +1,17 @@
 import { type ColumnDef, flexRender, getCoreRowModel, useReactTable } from "@tanstack/react-table";
 import { type CSSProperties, type Dispatch, useEffect, useMemo, useState } from "react";
-import { formatBytes, formatCell, formatRatio, numberFmt } from "./format";
-import { CATEGORY_LIMIT, type Categories, fetchAllCategoricalColumns } from "./formats/parquet";
+import { formatBytes, formatRatio, numberFmt } from "./format";
+import {
+  CATEGORY_LIMIT,
+  type Categories,
+  type ParquetType,
+  fetchAllCategoricalColumns,
+  formatCell,
+  isFilterableSimple,
+  typeChipString,
+} from "./formats/parquet";
 import type { ParquetFileInfo, ParquetMeta } from "./formats/parquet/types";
-import { isFilterableSimple, typeChipString } from "./parser";
-import type {
-  Action,
-  Column,
-  DuckDBType,
-  FilterOp,
-  FilterValue,
-  SortEntry,
-  Source,
-  State,
-} from "./types";
+import type { Action, Column, FilterOp, FilterValue, SortEntry, Source, State } from "./types";
 
 // Treat Column.meta as parquet metadata. The viewer is parquet-only today;
 // when a second adapter is added, replace this with discriminated typing.
@@ -106,7 +104,7 @@ export function JsonTree({ value, depth = 0 }: { value: unknown; depth?: number 
 // Cell view
 // =========================================================================
 
-function CellView({ value, type }: { value: unknown; type: DuckDBType }) {
+function CellView({ value, type }: { value: unknown; type: ParquetType }) {
   const [expanded, setExpanded] = useState(false);
   const f = formatCell(value, type);
   if (f.display === "muted")
@@ -163,7 +161,7 @@ const FILTER_OPS_BY_KIND: Record<string, FilterOp[]> = {
   FLOAT: ["eq", "neq", "lt", "lte", "gt", "gte", "between", "is_null", "is_not_null"],
   DOUBLE: ["eq", "neq", "lt", "lte", "gt", "gte", "between", "is_null", "is_not_null"],
   DECIMAL: ["eq", "neq", "lt", "lte", "gt", "gte", "between", "is_null", "is_not_null"],
-  VARCHAR: ["contains", "eq", "neq", "is_null", "is_not_null"],
+  STRING: ["contains", "eq", "neq", "is_null", "is_not_null"],
   JSON: ["contains", "is_null", "is_not_null"],
   UUID: ["eq", "neq", "is_null", "is_not_null"],
   ENUM: ["eq", "neq", "is_null", "is_not_null"],
@@ -188,7 +186,7 @@ const OP_LABELS: Record<FilterOp, string> = {
   is_not_null: "is not null",
 };
 
-function inputTypeFor(t: DuckDBType): string {
+function inputTypeFor(t: ParquetType): string {
   if (t.kind === "DATE") return "date";
   if (t.kind === "TIME") return "time";
   if (t.kind === "TIMESTAMP") return "datetime-local";
@@ -203,7 +201,7 @@ function FilterPopover({
   onChange,
   onClose,
 }: {
-  type: DuckDBType;
+  type: ParquetType;
   value: FilterValue | undefined;
   onChange: (v: FilterValue | undefined) => void;
   onClose: () => void;
@@ -301,7 +299,7 @@ function TypeChip({
   parquet,
   noTooltip,
 }: {
-  type: DuckDBType;
+  type: ParquetType;
   parquet?: ParquetMeta;
   noTooltip?: boolean;
 }) {

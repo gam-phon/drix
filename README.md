@@ -45,17 +45,25 @@ It's a focused tool: **parquet only**. No CSV, no JSON, no Excel — just a deep
 
 ```
 src/
-├── main.tsx           App, reducer, drag-drop, bootstrap
-├── components.tsx     Sidebar, DataTab, DataGrid, InfoView, RowDrawer, SqlView, TopBar, …
-├── duckdb.ts          DuckDB init, runQuery, fetchSchema, fetchFileInfo, fetchTotal
-├── parser.ts          parseDuckDBType, typeChipString (parquet labels), castExpr
-├── query.ts           quoteIdent, buildQuery, buildCountQuery, buildWhereClause
-├── format.ts          formatCell, jsonReplacer, materialize, formatBytes, decodeMaybeBytes
-├── types.ts           Shared types (DuckDBType, Column, ParquetMeta, ParquetFileInfo, State, Action, …)
-└── main.test.ts       Vitest suite — parser, query builder, formatters
+├── types.ts                 # Column, FormatAdapter, Source, State, Action  (re-exports ParquetType)
+├── duckdb.ts                # core engine: getDB, runQuery, fetchTotal
+├── query.ts                 # core: SQL builder (imports castExpr from parquet)
+├── format.ts                # core helpers: formatBytes, formatRatio, jsonReplacer, decodeMaybeBytes, materialize, pad, numberFmt
+├── components.tsx           # UI (imports parquet helpers from formats/parquet)
+├── main.tsx                 # bootstrap
+├── main.test.ts             # 47 tests
+└── formats/parquet/
+    ├── types.ts             # ParquetType + ParquetMeta + ParquetFileInfo
+    ├── parser.ts            # parseParquetType, typeChipString, castExpr, isFilterableSimple
+    ├── format.ts            # formatCell, FormatResult (parquet-aware value formatters)
+    ├── schema.ts            # fetchParquetSchema
+    ├── file-info.ts         # fetchParquetFileInfo
+    ├── categories.ts        # isCategoricalCandidate, fetchAllCategoricalColumns
+    ├── adapter.ts           # parquetAdapter
+    └── index.ts             # public entry exporting everything
 ```
 
-The pure helpers (parser, query builder, formatters) are isolated from React so they're trivially testable without a DOM.
+Anything parquet-specific lives in `src/formats/parquet/`. Core (`src/*.ts`) is format-agnostic — adding a second format means dropping a new folder under `src/formats/` that exports a `FormatAdapter`. The pure helpers (parser, query builder, formatters) are isolated from React so they're trivially testable without a DOM.
 
 ## Run it locally
 
