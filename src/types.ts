@@ -68,7 +68,7 @@ export type Snippet = { name: string; sql: string };
 export type State = {
   sources: Source[];
   activeAlias: string | null;
-  tab: "data" | "sql" | "info";
+  tab: "data" | "sql" | "info" | "optimize";
   page: number;
   pageSize: number;
   sort: SortEntry[];
@@ -97,7 +97,7 @@ export type Action =
   | { type: "ADD_SOURCE"; source: Source }
   | { type: "REMOVE_SOURCE"; alias: string }
   | { type: "SET_ACTIVE"; alias: string }
-  | { type: "SET_TAB"; tab: "data" | "sql" | "info" }
+  | { type: "SET_TAB"; tab: "data" | "sql" | "info" | "optimize" }
   | { type: "SET_PAGE"; page: number }
   | { type: "SET_PAGE_SIZE"; pageSize: number }
   | { type: "SET_SORT"; sort: SortEntry[] }

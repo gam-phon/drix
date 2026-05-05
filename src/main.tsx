@@ -5,6 +5,7 @@ import {
   DataTab,
   EmptyState,
   InfoView,
+  OptimizationView,
   RowDrawer,
   Sidebar,
   SqlView,
@@ -601,6 +602,12 @@ function App() {
             )
           ) : state.tab === "sql" ? (
             <SqlView state={state} dispatch={dispatch} runSql={runSql} />
+          ) : state.tab === "optimize" ? (
+            activeSource ? (
+              <OptimizationView source={activeSource} />
+            ) : (
+              <EmptyState loadingStage={state.loadingStage} />
+            )
           ) : activeSource ? (
             <InfoView source={activeSource} />
           ) : (
@@ -608,6 +615,7 @@ function App() {
           )}
         </main>
         {state.tab !== "info" &&
+          state.tab !== "optimize" &&
           (state.drawerCollapsed ? (
             <CollapseHandle side="right" onExpand={() => dispatch({ type: "TOGGLE_DRAWER" })} />
           ) : (

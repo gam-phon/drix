@@ -20,6 +20,11 @@ import {
   isFilterableSimple,
   typeChipString,
 } from "./formats/parquet";
+import {
+  type Suggestion,
+  type SuggestionCategory,
+  analyzeParquet,
+} from "./formats/parquet/optimize";
 import type { ParquetFileInfo, ParquetMeta } from "./formats/parquet/types";
 import type { Action, Column, FilterOp, FilterValue, SortEntry, Source, State } from "./types";
 
@@ -434,7 +439,7 @@ export function TopBar({
   onExport,
 }: {
   state: State;
-  onTabChange: (t: "data" | "sql" | "info") => void;
+  onTabChange: (t: "data" | "sql" | "info" | "optimize") => void;
   onTheme: () => void;
   onExport: () => void;
 }) {
@@ -477,9 +482,17 @@ export function TopBar({
           type="button"
           onClick={() => onTabChange("info")}
           className={state.tab === "info" ? "primary" : ""}
-          style={{ borderRadius: "0 6px 6px 0", borderLeft: "none" }}
+          style={{ borderRadius: 0, borderLeft: "none" }}
         >
           Info
+        </button>
+        <button
+          type="button"
+          onClick={() => onTabChange("optimize")}
+          className={state.tab === "optimize" ? "primary" : ""}
+          style={{ borderRadius: "0 6px 6px 0", borderLeft: "none" }}
+        >
+          Optimize
         </button>
       </div>
       <div style={{ flex: 1 }} />
@@ -819,6 +832,35 @@ const DataRow = memo(function DataRow({ row, rowIdx, isSelected, isOdd, onSelect
   );
 });
 
+// Scrolls the grid one column left (-1) or right (+1) using the live thead
+// offsets. Reading offsets each call keeps it correct under hide/reorder/resize.
+function scrollByColumn(container: HTMLDivElement | null, dir: 1 | -1) {
+  if (!container) return;
+  const ths = container.querySelectorAll<HTMLTableCellElement>("thead th");
+  if (ths.length === 0) return;
+  const left = container.scrollLeft;
+  const right = left + container.clientWidth;
+  let target: number | null = null;
+  if (dir === 1) {
+    // First column whose right edge is past the viewport's right edge.
+    for (const th of ths) {
+      const colRight = th.offsetLeft + th.offsetWidth;
+      if (colRight > right + 1) {
+        target = th.offsetLeft;
+        break;
+      }
+    }
+  } else {
+    // Last column whose left edge is before the viewport's left edge.
+    for (const th of ths) {
+      if (th.offsetLeft < left - 1) target = th.offsetLeft;
+      else break;
+    }
+  }
+  if (target == null) return;
+  container.scrollTo({ left: Math.max(0, target), behavior: "smooth" });
+}
+
 function DataGrid({
   columns,
   rows,
@@ -948,6 +990,12 @@ function DataGrid({
       } else if (key === "k") {
         e.preventDefault();
         moveBy(-1);
+      } else if (key === "l") {
+        e.preventDefault();
+        scrollByColumn(scrollRef.current, 1);
+      } else if (key === "h") {
+        e.preventDefault();
+        scrollByColumn(scrollRef.current, -1);
       } else if (key === "d" && ctrl) {
         e.preventDefault();
         moveBy(half);
@@ -1383,7 +1431,7 @@ export function DataTab({
       <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
         <h2 style={{ margin: 0, fontSize: 14 }}>{source.displayName}</h2>
         <span style={{ color: "var(--fg-muted)", fontSize: 12 }}>
-          {numberFmt.format(source.total)} rows
+          {numberFmt.format(source.total)} rows · {numberFmt.format(source.columns.length)} cols
         </span>
       </div>
       {state.quickFilterOpen ? (
@@ -2021,6 +2069,274 @@ export function InfoView({ source }: { source: Source }) {
 
       {!info && !error && <div style={{ color: "var(--fg-muted)" }}>loading file metadata…</div>}
     </div>
+  );
+}
+
+// =========================================================================
+// Optimization tab
+// =========================================================================
+
+const SUGGESTION_GROUP_TITLES: Record<SuggestionCategory, string> = {
+  type: "Type changes",
+  compression: "Compression",
+  encoding: "Encoding",
+  bloom: "Bloom filters",
+  rowgroup: "Row groups",
+  file: "File-level",
+};
+
+const SUGGESTION_GROUP_ORDER: SuggestionCategory[] = [
+  "type",
+  "compression",
+  "encoding",
+  "bloom",
+  "rowgroup",
+  "file",
+];
+
+export function OptimizationView({ source }: { source: Source }) {
+  const [info, setInfo] = useState<ParquetFileInfo | null>(null);
+  const [suggestions, setSuggestions] = useState<Suggestion[] | null>(null);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Reset on source change so a new file shows the unrun state.
+  useEffect(() => {
+    let cancelled = false;
+    setInfo(null);
+    setSuggestions(null);
+    setError(null);
+    source.adapter
+      .fetchFileInfo(source.alias, source.fileSizeBytes)
+      .then((i) => {
+        if (!cancelled) setInfo(i as ParquetFileInfo | null);
+      })
+      .catch((e) => {
+        if (!cancelled) setError((e as Error).message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [source]);
+
+  const onRun = useCallback(async () => {
+    if (!info) return;
+    setRunning(true);
+    setError(null);
+    try {
+      const out = await analyzeParquet(source.adapter, source.alias, source.columns, info);
+      setSuggestions(out);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setRunning(false);
+    }
+  }, [info, source]);
+
+  const grouped = useMemo(() => {
+    const m = new Map<SuggestionCategory, Suggestion[]>();
+    if (!suggestions) return m;
+    for (const s of suggestions) {
+      const arr = m.get(s.category) ?? [];
+      arr.push(s);
+      m.set(s.category, arr);
+    }
+    return m;
+  }, [suggestions]);
+
+  const totals = useMemo(() => {
+    if (!suggestions) return null;
+    let high = 0;
+    let medium = 0;
+    let low = 0;
+    let savings = 0;
+    for (const s of suggestions) {
+      if (s.severity === "high") high++;
+      else if (s.severity === "medium") medium++;
+      else low++;
+      savings += s.estSavingsBytes ?? 0;
+    }
+    return { total: suggestions.length, high, medium, low, savings };
+  }, [suggestions]);
+
+  return (
+    <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 20, maxWidth: 1100 }}>
+      <div>
+        <h2
+          style={{
+            margin: 0,
+            fontSize: 18,
+            fontFamily: "var(--mono)",
+            wordBreak: "break-all",
+          }}
+        >
+          {source.displayName}
+        </h2>
+        <div style={{ color: "var(--fg-muted)", fontSize: 12, marginTop: 2 }}>
+          Optimization analysis · {source.alias}
+        </div>
+      </div>
+
+      <div
+        style={{
+          border: "1px solid var(--border)",
+          borderRadius: 6,
+          padding: 12,
+          background: "var(--bg-alt)",
+          display: "flex",
+          flexDirection: "column",
+          gap: 8,
+        }}
+      >
+        <div style={{ fontSize: 12, color: "var(--fg-muted)" }}>
+          Deep-scans every column to suggest tighter types, better compression codecs and encodings,
+          bloom filters, and row-group sort keys. Read-only — no file is modified.
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button type="button" className="primary" onClick={onRun} disabled={!info || running}>
+            {running ? "Analyzing…" : suggestions ? "Re-run analysis" : "Run analysis"}
+          </button>
+          {!info && !error && (
+            <span style={{ color: "var(--fg-muted)", fontSize: 12 }}>loading file metadata…</span>
+          )}
+        </div>
+      </div>
+
+      {error && <div style={{ color: "var(--danger)" }}>{error}</div>}
+
+      {totals && (
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+            gap: 12,
+          }}
+        >
+          <InfoCard title="Suggestions">
+            <KvRow k="total" v={numberFmt.format(totals.total)} />
+            <KvRow k="high" v={numberFmt.format(totals.high)} />
+            <KvRow k="medium" v={numberFmt.format(totals.medium)} />
+            <KvRow k="low" v={numberFmt.format(totals.low)} />
+          </InfoCard>
+          <InfoCard title="Estimated savings">
+            <KvRow k="bytes" v={totals.savings > 0 ? formatBytes(totals.savings) : "—"} />
+            <KvRow
+              k="of file"
+              v={
+                totals.savings > 0 && source.fileSizeBytes > 0
+                  ? `${((totals.savings / source.fileSizeBytes) * 100).toFixed(1)}%`
+                  : "—"
+              }
+            />
+          </InfoCard>
+        </div>
+      )}
+
+      {suggestions && suggestions.length === 0 && (
+        <div
+          style={{
+            padding: 12,
+            border: "1px solid var(--border)",
+            borderRadius: 6,
+            background: "var(--bg-alt)",
+            color: "var(--fg-muted)",
+          }}
+        >
+          No suggestions — looks well-tuned.
+        </div>
+      )}
+
+      {suggestions &&
+        SUGGESTION_GROUP_ORDER.map((cat) => {
+          const items = grouped.get(cat);
+          if (!items || items.length === 0) return null;
+          return (
+            <Section key={cat} title={`${SUGGESTION_GROUP_TITLES[cat]} (${items.length})`}>
+              <div style={{ overflow: "auto", border: "1px solid var(--border)", borderRadius: 6 }}>
+                <table
+                  style={{
+                    width: "100%",
+                    borderCollapse: "collapse",
+                    fontSize: 11,
+                    fontFamily: "var(--mono)",
+                  }}
+                >
+                  <thead style={{ background: "var(--bg-alt)" }}>
+                    <tr style={{ color: "var(--fg-muted)", textAlign: "left" }}>
+                      <Th>severity</Th>
+                      <Th>column</Th>
+                      <Th>suggestion</Th>
+                      <Th>current</Th>
+                      <Th>suggested</Th>
+                      <Th>reason</Th>
+                      <Th align="right">est. savings</Th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {items.map((s, i) => (
+                      <tr
+                        key={s.id}
+                        style={{
+                          background: i % 2 === 1 ? "var(--row-alt)" : "transparent",
+                          borderTop: "1px solid var(--border)",
+                        }}
+                      >
+                        <Td>
+                          <SeverityChip severity={s.severity} />
+                        </Td>
+                        <Td>{s.column ?? "—"}</Td>
+                        <Td>
+                          <span style={{ fontWeight: 600 }}>{s.title}</span>
+                        </Td>
+                        <Td>{s.current}</Td>
+                        <Td>{s.suggested}</Td>
+                        <Td>
+                          <span
+                            style={{
+                              fontFamily: "var(--sans)",
+                              whiteSpace: "normal",
+                              color: "var(--fg-muted)",
+                            }}
+                          >
+                            {s.reason}
+                          </span>
+                        </Td>
+                        <Td align="right">
+                          {s.estSavingsBytes ? formatBytes(s.estSavingsBytes) : "—"}
+                        </Td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Section>
+          );
+        })}
+    </div>
+  );
+}
+
+function SeverityChip({ severity }: { severity: Suggestion["severity"] }) {
+  const palette: Record<Suggestion["severity"], { bg: string; fg: string; label: string }> = {
+    high: { bg: "var(--danger, #c0392b)", fg: "#fff", label: "high" },
+    medium: { bg: "var(--chip-bg)", fg: "var(--chip-fg)", label: "med" },
+    low: { bg: "transparent", fg: "var(--fg-muted)", label: "low" },
+  };
+  const p = palette[severity];
+  return (
+    <span
+      style={{
+        background: p.bg,
+        color: p.fg,
+        padding: "1px 6px",
+        borderRadius: 999,
+        fontSize: 10,
+        border: severity === "low" ? "1px solid var(--border)" : "none",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {p.label}
+    </span>
   );
 }
 
