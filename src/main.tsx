@@ -298,6 +298,13 @@ function App() {
             adapter,
           },
         });
+        // Warm the file-info cache in the background so Info / Optimize tabs
+        // open instantly later. The first call is what kicks off the (slow on
+        // wide files) parquet_metadata queries; subsequent callers reuse the
+        // cached Promise.
+        void adapter.fetchFileInfo(alias, file.size).catch(() => {
+          /* surfaced again when the user opens Info/Optimize */
+        });
       } catch (e) {
         dispatch({ type: "SET_ERROR", error: (e as Error).message });
       } finally {

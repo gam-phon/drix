@@ -62,7 +62,8 @@ export async function startOptimize(
   adapter: FormatAdapter,
   alias: string,
   columns: Column[],
-  info: ParquetFileInfo,
+  fileSizeBytes: number,
+  info: ParquetFileInfo | null,
 ): Promise<void> {
   const cur = cache.get(alias);
   if (cur?.status === "running") return; // already in-flight for this alias
@@ -75,7 +76,9 @@ export async function startOptimize(
     progress: { done: 0, total: columns.length, phase: "columns" },
   });
   try {
-    const suggestions = await analyzeParquet(adapter, alias, columns, info, (p) => {
+    // analyzeParquet kicks off probes immediately and fetches metadata in
+    // parallel — it never blocks on info being ready.
+    const suggestions = await analyzeParquet(adapter, alias, columns, fileSizeBytes, info, (p) => {
       set(alias, { progress: p });
     });
     set(alias, {

@@ -87,100 +87,127 @@ function isNumericKind(t: ParquetType): boolean {
   return t.kind === "INT" || t.kind === "FLOAT" || t.kind === "DOUBLE" || t.kind === "DECIMAL";
 }
 
-function buildProbeSql(adapter: FormatAdapter, alias: string, col: Column): string | null {
-  const id = quoteIdent(col.name);
+function probeableKind(t: ParquetType): boolean {
+  return t.kind !== "LIST" && t.kind !== "MAP" && t.kind !== "STRUCT" && t.kind !== "UNKNOWN";
+}
+
+// Build a single SQL that computes every probe for an entire batch of columns
+// in one parquet scan. Aliases each output as `c<idx>_<probe>` so we can map
+// back to the column. Cuts query roundtrip cost by ~batch-size× — the dominant
+// cost on Wasm DuckDB is per-query overhead, not the aggregates themselves.
+function buildBatchedProbeSql(
+  adapter: FormatAdapter,
+  alias: string,
+  batch: Column[],
+): string | null {
+  const probable = batch.filter((c) => probeableKind(c.type));
+  if (probable.length === 0) return null;
   const from = adapter.fromExpr(alias);
-  const t = col.type;
-  const exprs: string[] = [
-    "COUNT(*) AS total_rows",
-    `COUNT(${id}) AS non_null`,
-    `COUNT(DISTINCT ${id}) AS distinct_count`,
-  ];
+  const exprs: string[] = ["COUNT(*) AS total_rows"];
+  for (let i = 0; i < probable.length; i++) {
+    const col = probable[i];
+    const id = quoteIdent(col.name);
+    const p = `c${i}`;
+    const t = col.type;
+    exprs.push(`COUNT(${id}) AS ${p}_non_null`);
+    exprs.push(`COUNT(DISTINCT ${id}) AS ${p}_distinct`);
 
-  if (t.kind === "INT") {
-    exprs.push(
-      `MIN(${id}) AS num_min`,
-      `MAX(${id}) AS num_max`,
-      `BOOL_AND(${id} >= LAG(${id}) OVER ()) AS num_sorted`,
-    );
-  } else if (t.kind === "FLOAT" || t.kind === "DOUBLE") {
-    exprs.push(
-      `MIN(${id}) AS num_min`,
-      `MAX(${id}) AS num_max`,
-      `MAX(ABS(${id})) AS num_abs_max`,
-      `BOOL_AND(${id} = TRY_CAST(TRY_CAST(${id} AS BIGINT) AS DOUBLE)) AS num_int_valued`,
-    );
-    if (t.kind === "DOUBLE") {
-      exprs.push(`BOOL_AND(${id} = CAST(CAST(${id} AS FLOAT) AS DOUBLE)) AS num_float_roundtrips`);
+    if (t.kind === "INT") {
+      exprs.push(`MIN(${id}) AS ${p}_num_min`, `MAX(${id}) AS ${p}_num_max`);
+    } else if (t.kind === "FLOAT" || t.kind === "DOUBLE") {
+      exprs.push(
+        `MIN(${id}) AS ${p}_num_min`,
+        `MAX(${id}) AS ${p}_num_max`,
+        `MAX(ABS(${id})) AS ${p}_num_abs_max`,
+        `BOOL_AND(${id} = TRY_CAST(TRY_CAST(${id} AS BIGINT) AS DOUBLE)) AS ${p}_num_int_valued`,
+      );
+      if (t.kind === "DOUBLE") {
+        exprs.push(
+          `BOOL_AND(${id} = CAST(CAST(${id} AS FLOAT) AS DOUBLE)) AS ${p}_num_float_roundtrips`,
+        );
+      }
+    } else if (t.kind === "DECIMAL") {
+      exprs.push(`MAX(ABS(${id})) AS ${p}_num_abs_max`);
+    } else if (t.kind === "STRING" || t.kind === "BYTE_ARRAY") {
+      exprs.push(
+        `MIN(LENGTH(${id})) AS ${p}_str_min_len`,
+        `MAX(LENGTH(${id})) AS ${p}_str_max_len`,
+        `BOOL_AND(REGEXP_MATCHES(${id}, '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')) AS ${p}_str_all_uuid`,
+        `BOOL_AND(REGEXP_MATCHES(${id}, '^[+-]?[0-9]+$')) AS ${p}_str_all_int`,
+        `BOOL_AND(REGEXP_MATCHES(${id}, '^\\d{4}-\\d{2}-\\d{2}$')) AS ${p}_str_all_date`,
+        `BOOL_AND(starts_with(trim(${id}), '{') OR starts_with(trim(${id}), '[')) AS ${p}_str_all_json`,
+      );
+    } else if (t.kind === "TIMESTAMP") {
+      exprs.push(
+        `BOOL_AND(EXTRACT(microsecond FROM ${id}) = 0) AS ${p}_ts_subsec_zero`,
+        `BOOL_AND(EXTRACT(hour FROM ${id}) = 0 AND EXTRACT(minute FROM ${id}) = 0 AND EXTRACT(second FROM ${id}) = 0 AND EXTRACT(microsecond FROM ${id}) = 0) AS ${p}_ts_midnight`,
+      );
+      if (t.unit === "NANOS") {
+        exprs.push(`BOOL_AND((EXTRACT(nanosecond FROM ${id}) % 1000) = 0) AS ${p}_ts_nanos_zero`);
+      }
     }
-  } else if (t.kind === "DECIMAL") {
-    exprs.push(`MAX(ABS(${id})) AS num_abs_max`);
-  } else if (t.kind === "STRING" || t.kind === "BYTE_ARRAY") {
-    exprs.push(
-      `MIN(LENGTH(${id})) AS str_min_len`,
-      `MAX(LENGTH(${id})) AS str_max_len`,
-      `BOOL_AND(REGEXP_MATCHES(${id}, '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')) AS str_all_uuid`,
-      `BOOL_AND(REGEXP_MATCHES(${id}, '^[+-]?[0-9]+$')) AS str_all_int`,
-      `BOOL_AND(REGEXP_MATCHES(${id}, '^\\d{4}-\\d{2}-\\d{2}$')) AS str_all_date`,
-      `BOOL_AND(starts_with(trim(${id}), '{') OR starts_with(trim(${id}), '[')) AS str_all_json`,
-    );
-  } else if (t.kind === "TIMESTAMP") {
-    exprs.push(
-      `BOOL_AND(EXTRACT(microsecond FROM ${id}) = 0) AS ts_subsec_zero`,
-      `BOOL_AND(EXTRACT(hour FROM ${id}) = 0 AND EXTRACT(minute FROM ${id}) = 0 AND EXTRACT(second FROM ${id}) = 0 AND EXTRACT(microsecond FROM ${id}) = 0) AS ts_midnight`,
-    );
-    if (t.unit === "NANOS") {
-      exprs.push(`BOOL_AND((EXTRACT(nanosecond FROM ${id}) % 1000) = 0) AS ts_nanos_zero`);
-    }
-  } else if (t.kind === "TIME") {
-    // nothing extra
-  } else {
-    // BOOLEAN / nested / UUID / DATE / unknown — skip type-narrowing probes,
-    // base aggregates above are enough for encoding/compression rules.
   }
-
   return `SELECT ${exprs.join(", ")} FROM ${from}`;
 }
 
-async function runColumnProbe(
+async function runBatchedProbes(
   adapter: FormatAdapter,
   alias: string,
-  col: Column,
-): Promise<ColumnProbe | null> {
-  // Skip probes that DuckDB can't aggregate over (nested types).
-  const k = col.type.kind;
-  if (k === "LIST" || k === "MAP" || k === "STRUCT" || k === "UNKNOWN") return null;
-  const sql = buildProbeSql(adapter, alias, col);
-  if (!sql) return null;
+  batch: Column[],
+): Promise<Map<string, ColumnProbe>> {
+  const out = new Map<string, ColumnProbe>();
+  const probable = batch.filter((c) => probeableKind(c.type));
+  if (probable.length === 0) return out;
+  const sql = buildBatchedProbeSql(adapter, alias, batch);
+  if (!sql) return out;
   try {
     const { result } = await runQuery(sql);
     const rows = result.toArray() as Array<Record<string, unknown>>;
     const r = rows[0] ?? {};
     const total = asNumber(r.total_rows) ?? 0;
-    const nonNull = asNumber(r.non_null) ?? 0;
-    return {
-      numValues: total,
-      nulls: total - nonNull,
-      distinct: asNumber(r.distinct_count),
-      numMin: asNumber(r.num_min),
-      numMax: asNumber(r.num_max),
-      numAbsMax: asNumber(r.num_abs_max),
-      numIntegerValued: asBool(r.num_int_valued),
-      numFloatRoundTrips: asBool(r.num_float_roundtrips),
-      numSorted: asBool(r.num_sorted),
-      strMinLen: asNumber(r.str_min_len),
-      strMaxLen: asNumber(r.str_max_len),
-      strAllUuid: asBool(r.str_all_uuid),
-      strAllInt: asBool(r.str_all_int),
-      strAllDate: asBool(r.str_all_date),
-      strAllJson: asBool(r.str_all_json),
-      tsAllSubsecondZero: asBool(r.ts_subsec_zero),
-      tsAllMidnight: asBool(r.ts_midnight),
-      tsAllNanosZero: asBool(r.ts_nanos_zero),
-    };
+    for (let i = 0; i < probable.length; i++) {
+      const col = probable[i];
+      const p = `c${i}`;
+      const nonNull = asNumber(r[`${p}_non_null`]) ?? 0;
+      out.set(col.name, {
+        numValues: total,
+        nulls: total - nonNull,
+        distinct: asNumber(r[`${p}_distinct`]),
+        numMin: asNumber(r[`${p}_num_min`]),
+        numMax: asNumber(r[`${p}_num_max`]),
+        numAbsMax: asNumber(r[`${p}_num_abs_max`]),
+        numIntegerValued: asBool(r[`${p}_num_int_valued`]),
+        numFloatRoundTrips: asBool(r[`${p}_num_float_roundtrips`]),
+        numSorted: undefined,
+        strMinLen: asNumber(r[`${p}_str_min_len`]),
+        strMaxLen: asNumber(r[`${p}_str_max_len`]),
+        strAllUuid: asBool(r[`${p}_str_all_uuid`]),
+        strAllInt: asBool(r[`${p}_str_all_int`]),
+        strAllDate: asBool(r[`${p}_str_all_date`]),
+        strAllJson: asBool(r[`${p}_str_all_json`]),
+        tsAllSubsecondZero: asBool(r[`${p}_ts_subsec_zero`]),
+        tsAllMidnight: asBool(r[`${p}_ts_midnight`]),
+        tsAllNanosZero: asBool(r[`${p}_ts_nanos_zero`]),
+      });
+    }
   } catch {
-    return null;
+    // If the batched query fails (e.g. expression count limit), fall back to
+    // per-column probes for this batch so the rest of the analysis can proceed.
+    for (const col of probable) {
+      const single = await runSingleColumnProbe(adapter, alias, col);
+      if (single) out.set(col.name, single);
+    }
   }
+  return out;
+}
+
+async function runSingleColumnProbe(
+  adapter: FormatAdapter,
+  alias: string,
+  col: Column,
+): Promise<ColumnProbe | null> {
+  const sub = await runBatchedProbes(adapter, alias, [col]);
+  return sub.get(col.name) ?? null;
 }
 
 // ------------------------------------------------------------------
@@ -837,6 +864,49 @@ const CATEGORY_ORDER: Record<SuggestionCategory, number> = {
 };
 
 // ------------------------------------------------------------------
+// CSV serialization (for downloading the report)
+// ------------------------------------------------------------------
+
+function csvCell(v: string | number | undefined): string {
+  if (v == null) return "";
+  const s = String(v);
+  // Escape per RFC 4180: wrap in quotes if it contains comma, quote, or newline.
+  if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+export function suggestionsToCsv(suggestions: Suggestion[]): string {
+  const headers = [
+    "severity",
+    "category",
+    "column",
+    "title",
+    "current",
+    "suggested",
+    "reason",
+    "estSavingsBytes",
+  ];
+  const lines = [headers.join(",")];
+  for (const s of suggestions) {
+    lines.push(
+      [
+        s.severity,
+        s.category,
+        s.column ?? "",
+        s.title,
+        s.current,
+        s.suggested,
+        s.reason,
+        s.estSavingsBytes ?? "",
+      ]
+        .map(csvCell)
+        .join(","),
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+// ------------------------------------------------------------------
 // Public entry point
 // ------------------------------------------------------------------
 
@@ -846,32 +916,55 @@ export type AnalyzeProgress = {
   phase: "columns" | "rowgroups" | "done";
 };
 
+// Tunable: how many columns share one DuckDB scan. Bigger = fewer roundtrips
+// but each query has more output expressions (DuckDB handles thousands
+// comfortably, but tiny memory ceiling on Wasm makes us conservative).
+const BATCH_SIZE = 64;
+
 export async function analyzeParquet(
   adapter: FormatAdapter,
   alias: string,
   columns: Column[],
-  info: ParquetFileInfo,
+  fileSizeBytes: number,
+  cachedInfo: ParquetFileInfo | null,
   onProgress?: (p: AnalyzeProgress) => void,
 ): Promise<Suggestion[]> {
   const probesByColumn = new Map<string, ColumnProbe | null>();
   const total = columns.length;
   onProgress?.({ done: 0, total, phase: "columns" });
 
-  // Run per-column probes in parallel; DuckDB streams parquet column-by-column
-  // so concurrent aggregates don't multiply IO. Each completion bumps the
-  // progress counter so the UI can extrapolate an ETA.
+  // Kick off the metadata fetch in parallel — the column probes don't need it,
+  // so don't make the user wait for parquet_metadata before progress shows.
+  // adapter.fetchFileInfo is cached per alias so this is free if it's already
+  // in flight from the file-load prefetch.
+  const infoPromise: Promise<ParquetFileInfo | null> = cachedInfo
+    ? Promise.resolve(cachedInfo)
+    : adapter
+        .fetchFileInfo(alias, fileSizeBytes)
+        .then((i) => i as ParquetFileInfo | null)
+        .catch(() => null);
+
+  // Issue probes one batch at a time. Each batch is one DuckDB query covering
+  // many columns — for 4k+ columns this turns ~thousands of roundtrips into
+  // a few dozen.
   let done = 0;
-  const probeResults = await Promise.all(
-    columns.map(async (c) => {
-      const p = await runColumnProbe(adapter, alias, c);
-      done++;
-      onProgress?.({ done, total, phase: "columns" });
-      return [c.name, p] as const;
-    }),
-  );
-  for (const [name, p] of probeResults) probesByColumn.set(name, p);
+  for (let start = 0; start < columns.length; start += BATCH_SIZE) {
+    const batch = columns.slice(start, start + BATCH_SIZE);
+    const probes = await runBatchedProbes(adapter, alias, batch);
+    for (const c of batch) probesByColumn.set(c.name, probes.get(c.name) ?? null);
+    done += batch.length;
+    onProgress?.({ done, total, phase: "columns" });
+  }
 
   onProgress?.({ done: total, total, phase: "rowgroups" });
+  const resolvedInfo = await infoPromise;
+  const info: ParquetFileInfo = resolvedInfo ?? {
+    numRows: 0,
+    numRowGroups: 0,
+    fileSizeBytes,
+    kv: [],
+    rowGroups: [],
+  };
   const rgStats = await fetchRowGroupStats(alias, columns);
 
   const suggestions: Suggestion[] = [];

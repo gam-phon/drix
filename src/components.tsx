@@ -21,7 +21,11 @@ import {
   isFilterableSimple,
   typeChipString,
 } from "./formats/parquet";
-import type { Suggestion, SuggestionCategory } from "./formats/parquet/optimize";
+import {
+  type Suggestion,
+  type SuggestionCategory,
+  suggestionsToCsv,
+} from "./formats/parquet/optimize";
 import {
   type OptimizeEntry,
   getOptimizeEntry,
@@ -998,6 +1002,23 @@ function DataGrid({
     if (selectedIdx == null) return;
     rowVirtualizer.scrollToIndex(selectedIdx, { align: "auto" });
   }, [selectedIdx, rowVirtualizer]);
+
+  // When the grid is hidden via `display: none` on tab switch, the virtualizer
+  // measures the scroll container as 0×0 and renders no rows. Watch the
+  // container's size and explicitly remeasure as soon as it becomes visible
+  // again — otherwise the body shows up empty until something else nudges it.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    let lastHeight = el.clientHeight;
+    const ro = new ResizeObserver(() => {
+      const h = el.clientHeight;
+      if (h > 0 && h !== lastHeight) rowVirtualizer.measure();
+      lastHeight = h;
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [rowVirtualizer]);
 
   // Refs let the window listener stay attached for the whole DataGrid lifetime
   // (no re-attach on every prop change) while still seeing fresh state.
@@ -2167,8 +2188,7 @@ export function OptimizationView({ source }: { source: Source }) {
   }, [entry.status]);
 
   const onRun = useCallback(() => {
-    if (!info) return;
-    void startOptimize(source.adapter, source.alias, source.columns, info);
+    void startOptimize(source.adapter, source.alias, source.columns, source.fileSizeBytes, info);
   }, [info, source]);
 
   const suggestions = entry.suggestions;
@@ -2219,11 +2239,22 @@ export function OptimizationView({ source }: { source: Source }) {
           bloom filters, and row-group sort keys. Read-only — no file is modified.
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-          <button type="button" className="primary" onClick={onRun} disabled={!info || running}>
+          <button type="button" className="primary" onClick={onRun} disabled={running}>
             {running ? "Analyzing…" : suggestions ? "Re-run analysis" : "Run analysis"}
           </button>
-          {!info && !error && (
-            <span style={{ color: "var(--fg-muted)", fontSize: 12 }}>loading file metadata…</span>
+          {suggestions && suggestions.length > 0 && (
+            <button
+              type="button"
+              onClick={() => exportSuggestionsCsv(source.displayName, suggestions)}
+              title="Download the suggestions list as CSV"
+            >
+              Export CSV
+            </button>
+          )}
+          {!info && !error && !running && (
+            <span style={{ color: "var(--fg-muted)", fontSize: 12 }}>
+              loading file metadata in background…
+            </span>
           )}
           {running && (
             <ProgressLine
@@ -2421,6 +2452,17 @@ function ProgressLine({
       </div>
     </div>
   );
+}
+
+function exportSuggestionsCsv(displayName: string, suggestions: Suggestion[]) {
+  const csv = suggestionsToCsv(suggestions);
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${displayName.replace(/\.parquet$/i, "")}.optimization.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 function formatDuration(ms: number): string {
