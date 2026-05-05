@@ -395,7 +395,6 @@ const TypeChip = memo(function TypeChip({
   // Display label caps recursion depth so a deeply nested STRUCT doesn't blow
   // up into a 5000-char header. Full structure goes in the click-pinned popover.
   const label = useMemo(() => typeChipString(type, { maxDepth: 1 }), [type]);
-  const fullLabel = useMemo(() => typeChipString(type), [type]);
   const isNested = type.kind === "STRUCT" || type.kind === "LIST" || type.kind === "MAP";
   const hasMeta = !!parquet && Object.values(parquet).some((v) => v != null);
   const open = !noTooltip && (pinned || hover) && (isNested || hasMeta);
@@ -434,7 +433,6 @@ const TypeChip = memo(function TypeChip({
       }}
       role={isNested || hasMeta ? "button" : undefined}
       tabIndex={isNested || hasMeta ? 0 : undefined}
-      title={!pinned && fullLabel !== label ? fullLabel : undefined}
       style={{
         display: "inline-block",
         background: "var(--chip-bg)",
@@ -2213,6 +2211,111 @@ export function InfoView({ source }: { source: Source }) {
 
 const COL_PAGE_SIZES = [20, 50, 100, 500];
 
+// Reusable filter + paginate toolbar. Used by every "list of columns" table
+// in Info and Insight so the UX (and keyboard reach) is identical.
+function TablePager({
+  total,
+  rawTotal,
+  page,
+  pageSize,
+  filter,
+  onPage,
+  onPageSize,
+  onFilter,
+  placeholder,
+  unit,
+}: {
+  total: number;
+  rawTotal: number;
+  page: number;
+  pageSize: number;
+  filter: string;
+  onPage: (p: number) => void;
+  onPageSize: (s: number) => void;
+  onFilter: (f: string) => void;
+  placeholder?: string;
+  unit?: string;
+}) {
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(page, pageCount - 1);
+  const start = safePage * pageSize;
+  const end = Math.min(start + pageSize, total);
+  const u = unit ?? "items";
+  return (
+    <div
+      style={{
+        display: "flex",
+        gap: 8,
+        alignItems: "center",
+        flexWrap: "wrap",
+        marginBottom: 8,
+        fontSize: 12,
+      }}
+    >
+      <input
+        type="text"
+        value={filter}
+        onChange={(e) => onFilter(e.target.value)}
+        placeholder={placeholder ?? "filter by name…"}
+        style={{
+          flex: 1,
+          minWidth: 200,
+          padding: "4px 8px",
+          background: "var(--bg)",
+          border: "1px solid var(--border)",
+          borderRadius: 4,
+          color: "var(--fg)",
+          fontSize: 12,
+        }}
+      />
+      <span style={{ color: "var(--fg-muted)", fontFamily: "var(--mono)" }}>
+        {total === 0
+          ? `0 ${u}`
+          : `${numberFmt.format(start + 1)}–${numberFmt.format(end)} of ${numberFmt.format(total)}${
+              filter ? ` (filtered from ${numberFmt.format(rawTotal)})` : ""
+            }`}
+      </span>
+      <label style={{ color: "var(--fg-muted)", display: "flex", gap: 4, alignItems: "center" }}>
+        page size
+        <select
+          value={pageSize}
+          onChange={(e) => onPageSize(Number(e.target.value))}
+          style={{
+            background: "var(--bg)",
+            border: "1px solid var(--border)",
+            color: "var(--fg)",
+            borderRadius: 4,
+            padding: "2px 4px",
+          }}
+        >
+          {COL_PAGE_SIZES.map((s) => (
+            <option key={s} value={s}>
+              {s}
+            </option>
+          ))}
+        </select>
+      </label>
+      <button
+        type="button"
+        disabled={safePage <= 0}
+        onClick={() => onPage(Math.max(0, safePage - 1))}
+      >
+        ← prev
+      </button>
+      <span style={{ color: "var(--fg-muted)", fontFamily: "var(--mono)" }}>
+        {numberFmt.format(safePage + 1)} / {numberFmt.format(pageCount)}
+      </span>
+      <button
+        type="button"
+        disabled={safePage >= pageCount - 1}
+        onClick={() => onPage(Math.min(pageCount - 1, safePage + 1))}
+      >
+        next →
+      </button>
+    </div>
+  );
+}
+
 function ColumnsTable({
   cols,
   categories,
@@ -2246,77 +2349,18 @@ function ColumnsTable({
 
   return (
     <>
-      <div
-        style={{
-          display: "flex",
-          gap: 8,
-          alignItems: "center",
-          flexWrap: "wrap",
-          marginBottom: 8,
-          fontSize: 12,
-        }}
-      >
-        <input
-          type="text"
-          value={filter}
-          onChange={(e) => onFilter(e.target.value)}
-          placeholder="filter columns by name…"
-          style={{
-            flex: 1,
-            minWidth: 200,
-            padding: "4px 8px",
-            background: "var(--bg)",
-            border: "1px solid var(--border)",
-            borderRadius: 4,
-            color: "var(--fg)",
-            fontSize: 12,
-          }}
-        />
-        <span style={{ color: "var(--fg-muted)", fontFamily: "var(--mono)" }}>
-          {total === 0
-            ? "0 columns"
-            : `${numberFmt.format(start + 1)}–${numberFmt.format(end)} of ${numberFmt.format(total)}${
-                filter ? ` (filtered from ${numberFmt.format(cols.length)})` : ""
-              }`}
-        </span>
-        <label style={{ color: "var(--fg-muted)", display: "flex", gap: 4, alignItems: "center" }}>
-          page size
-          <select
-            value={pageSize}
-            onChange={(e) => onPageSize(Number(e.target.value))}
-            style={{
-              background: "var(--bg)",
-              border: "1px solid var(--border)",
-              color: "var(--fg)",
-              borderRadius: 4,
-              padding: "2px 4px",
-            }}
-          >
-            {COL_PAGE_SIZES.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
-        </label>
-        <button
-          type="button"
-          disabled={safePage <= 0}
-          onClick={() => onPage(Math.max(0, safePage - 1))}
-        >
-          ← prev
-        </button>
-        <span style={{ color: "var(--fg-muted)", fontFamily: "var(--mono)" }}>
-          {numberFmt.format(safePage + 1)} / {numberFmt.format(pageCount)}
-        </span>
-        <button
-          type="button"
-          disabled={safePage >= pageCount - 1}
-          onClick={() => onPage(Math.min(pageCount - 1, safePage + 1))}
-        >
-          next →
-        </button>
-      </div>
+      <TablePager
+        total={total}
+        rawTotal={cols.length}
+        page={safePage}
+        pageSize={pageSize}
+        filter={filter}
+        onPage={onPage}
+        onPageSize={onPageSize}
+        onFilter={onFilter}
+        placeholder="filter columns by name…"
+        unit="columns"
+      />
       <div style={{ overflow: "auto", border: "1px solid var(--border)", borderRadius: 6 }}>
         <table
           style={{
@@ -2734,11 +2778,30 @@ export function InsightView({ source }: { source: Source }) {
   const [now, setNow] = useState(() => performance.now());
   const [glimpseRows, setGlimpseRows] = useState<Record<string, unknown>[] | null>(null);
   const [glimpseError, setGlimpseError] = useState<string | null>(null);
+  // Shared filter + page size across glimpse and per-family describe tables.
+  // Page index is per-table since each family has its own row count.
+  const [insightFilter, setInsightFilter] = useState("");
+  const [insightPageSize, setInsightPageSize] = useState(20);
+  const [glimpsePage, setGlimpsePage] = useState(0);
+  const [familyPages, setFamilyPages] = useState<Record<string, number>>({});
+  const setFamilyPage = useCallback((family: string, page: number) => {
+    setFamilyPages((m) => ({ ...m, [family]: page }));
+  }, []);
+  const resetPages = useCallback(() => {
+    setGlimpsePage(0);
+    setFamilyPages({});
+  }, []);
 
   useEffect(() => {
     setEntry(getInsightEntry(source.alias));
     return subscribeInsight(source.alias, () => setEntry(getInsightEntry(source.alias)));
   }, [source.alias]);
+
+  // Reset pagination when the source or the filter changes.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: resetPages is stable
+  useEffect(() => {
+    resetPages();
+  }, [source.alias, insightFilter]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2866,74 +2929,16 @@ export function InsightView({ source }: { source: Source }) {
           <div style={{ color: "var(--fg-muted)", fontSize: 12 }}>no rows</div>
         )}
         {glimpseRows != null && glimpseRows.length > 0 && (
-          <div style={{ overflow: "auto", border: "1px solid var(--border)", borderRadius: 6 }}>
-            <table
-              style={{
-                width: "100%",
-                borderCollapse: "collapse",
-                fontSize: 11,
-                fontFamily: "var(--mono)",
-              }}
-            >
-              <thead style={{ background: "var(--bg-alt)" }}>
-                <tr style={{ color: "var(--fg-muted)", textAlign: "left" }}>
-                  <Th>column</Th>
-                  <Th>type</Th>
-                  {glimpseRows.map((_, i) => (
-                    // biome-ignore lint/suspicious/noArrayIndexKey: glimpse rows are a frozen 5-row sample
-                    <Th key={i}>row {i + 1}</Th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {source.columns.map((c, i) => (
-                  <tr
-                    key={c.name}
-                    style={{
-                      background: i % 2 === 1 ? "var(--row-alt)" : "transparent",
-                      borderTop: "1px solid var(--border)",
-                    }}
-                  >
-                    <Td>
-                      <span style={{ fontWeight: 600 }}>{c.name}</span>
-                    </Td>
-                    <Td>
-                      <TypeChip type={c.type} />
-                    </Td>
-                    {glimpseRows.map((row, j) => {
-                      const cell = formatCell(row[c.name], c.type);
-                      const text =
-                        cell.display === "tree"
-                          ? cell.preview
-                          : cell.display === "blob"
-                            ? `<${cell.bytes.byteLength} bytes>`
-                            : cell.text;
-                      const muted = cell.display === "muted";
-                      return (
-                        // biome-ignore lint/suspicious/noArrayIndexKey: glimpse rows are a frozen 5-row sample
-                        <Td key={j}>
-                          <span
-                            title={text}
-                            style={{
-                              color: muted ? "var(--fg-muted)" : undefined,
-                              display: "inline-block",
-                              maxWidth: 180,
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              whiteSpace: "nowrap",
-                              verticalAlign: "bottom",
-                            }}
-                          >
-                            {shorten(text, 32)}
-                          </span>
-                        </Td>
-                      );
-                    })}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <GlimpseTable
+            cols={source.columns}
+            rows={glimpseRows}
+            page={glimpsePage}
+            pageSize={insightPageSize}
+            filter={insightFilter}
+            onPage={setGlimpsePage}
+            onPageSize={setInsightPageSize}
+            onFilter={setInsightFilter}
+          />
         )}
       </Section>
 
@@ -2944,7 +2949,16 @@ export function InsightView({ source }: { source: Source }) {
           if (!items || items.length === 0) return null;
           return (
             <Section key={fam} title={`${FAMILY_TITLES[fam]} (${items.length})`}>
-              <FamilyTable family={fam} stats={items} />
+              <FamilyTable
+                family={fam}
+                stats={items}
+                page={familyPages[fam] ?? 0}
+                pageSize={insightPageSize}
+                filter={insightFilter}
+                onPage={(p) => setFamilyPage(fam, p)}
+                onPageSize={setInsightPageSize}
+                onFilter={setInsightFilter}
+              />
             </Section>
           );
         })}
@@ -2952,42 +2966,201 @@ export function InsightView({ source }: { source: Source }) {
   );
 }
 
-function FamilyTable({ family, stats }: { family: string; stats: ColumnStat[] }) {
-  const headers = familyHeaders(family);
+function GlimpseTable({
+  cols,
+  rows,
+  page,
+  pageSize,
+  filter,
+  onPage,
+  onPageSize,
+  onFilter,
+}: {
+  cols: Column[];
+  rows: Record<string, unknown>[];
+  page: number;
+  pageSize: number;
+  filter: string;
+  onPage: (p: number) => void;
+  onPageSize: (s: number) => void;
+  onFilter: (f: string) => void;
+}) {
+  const filtered = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return cols;
+    return cols.filter((c) => c.name.toLowerCase().includes(q));
+  }, [cols, filter]);
+  const total = filtered.length;
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(page, pageCount - 1);
+  const start = safePage * pageSize;
+  const end = Math.min(start + pageSize, total);
+  const visible = filtered.slice(start, end);
   return (
-    <div style={{ overflow: "auto", border: "1px solid var(--border)", borderRadius: 6 }}>
-      <table
-        style={{
-          width: "100%",
-          borderCollapse: "collapse",
-          fontSize: 11,
-          fontFamily: "var(--mono)",
-        }}
-      >
-        <thead style={{ background: "var(--bg-alt)" }}>
-          <tr style={{ color: "var(--fg-muted)", textAlign: "left" }}>
-            {headers.map((h) => (
-              <Th key={h.key} align={h.align}>
-                {h.label}
-              </Th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {stats.map((s, i) => (
-            <tr
-              key={s.name}
-              style={{
-                background: i % 2 === 1 ? "var(--row-alt)" : "transparent",
-                borderTop: "1px solid var(--border)",
-              }}
-            >
-              {renderFamilyRow(family, s)}
+    <>
+      <TablePager
+        total={total}
+        rawTotal={cols.length}
+        page={safePage}
+        pageSize={pageSize}
+        filter={filter}
+        onPage={onPage}
+        onPageSize={onPageSize}
+        onFilter={onFilter}
+        placeholder="filter columns by name…"
+        unit="columns"
+      />
+      <div style={{ overflow: "auto", border: "1px solid var(--border)", borderRadius: 6 }}>
+        <table
+          style={{
+            width: "100%",
+            borderCollapse: "collapse",
+            fontSize: 11,
+            fontFamily: "var(--mono)",
+          }}
+        >
+          <thead style={{ background: "var(--bg-alt)" }}>
+            <tr style={{ color: "var(--fg-muted)", textAlign: "left" }}>
+              <Th>column</Th>
+              <Th>type</Th>
+              {rows.map((_, i) => (
+                // biome-ignore lint/suspicious/noArrayIndexKey: glimpse rows are a frozen 5-row sample
+                <Th key={i}>row {i + 1}</Th>
+              ))}
             </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+          </thead>
+          <tbody>
+            {visible.map((c, i) => (
+              <tr
+                key={c.name}
+                style={{
+                  background: i % 2 === 1 ? "var(--row-alt)" : "transparent",
+                  borderTop: "1px solid var(--border)",
+                }}
+              >
+                <Td>
+                  <span style={{ fontWeight: 600 }}>{c.name}</span>
+                </Td>
+                <Td>
+                  <TypeChip type={c.type} />
+                </Td>
+                {rows.map((row, j) => {
+                  const cell = formatCell(row[c.name], c.type);
+                  const text =
+                    cell.display === "tree"
+                      ? cell.preview
+                      : cell.display === "blob"
+                        ? `<${cell.bytes.byteLength} bytes>`
+                        : cell.text;
+                  const muted = cell.display === "muted";
+                  return (
+                    // biome-ignore lint/suspicious/noArrayIndexKey: glimpse rows are a frozen 5-row sample
+                    <Td key={j}>
+                      <span
+                        title={text}
+                        style={{
+                          color: muted ? "var(--fg-muted)" : undefined,
+                          display: "inline-block",
+                          maxWidth: 180,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                          verticalAlign: "bottom",
+                        }}
+                      >
+                        {shorten(text, 32)}
+                      </span>
+                    </Td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+function FamilyTable({
+  family,
+  stats,
+  page,
+  pageSize,
+  filter,
+  onPage,
+  onPageSize,
+  onFilter,
+}: {
+  family: string;
+  stats: ColumnStat[];
+  page: number;
+  pageSize: number;
+  filter: string;
+  onPage: (p: number) => void;
+  onPageSize: (s: number) => void;
+  onFilter: (f: string) => void;
+}) {
+  const headers = familyHeaders(family);
+  const filtered = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return stats;
+    return stats.filter((s) => s.name.toLowerCase().includes(q));
+  }, [stats, filter]);
+  const total = filtered.length;
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(page, pageCount - 1);
+  const start = safePage * pageSize;
+  const end = Math.min(start + pageSize, total);
+  const visible = filtered.slice(start, end);
+  return (
+    <>
+      <TablePager
+        total={total}
+        rawTotal={stats.length}
+        page={safePage}
+        pageSize={pageSize}
+        filter={filter}
+        onPage={onPage}
+        onPageSize={onPageSize}
+        onFilter={onFilter}
+        placeholder="filter columns by name…"
+        unit="columns"
+      />
+      <div style={{ overflow: "auto", border: "1px solid var(--border)", borderRadius: 6 }}>
+        <table
+          style={{
+            width: "100%",
+            borderCollapse: "collapse",
+            fontSize: 11,
+            fontFamily: "var(--mono)",
+          }}
+        >
+          <thead style={{ background: "var(--bg-alt)" }}>
+            <tr style={{ color: "var(--fg-muted)", textAlign: "left" }}>
+              {headers.map((h) => (
+                <Th key={h.key} align={h.align}>
+                  {h.label}
+                </Th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {visible.map((s, i) => (
+              <tr
+                key={s.name}
+                style={{
+                  background: i % 2 === 1 ? "var(--row-alt)" : "transparent",
+                  borderTop: "1px solid var(--border)",
+                }}
+              >
+                {renderFamilyRow(family, s)}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
   );
 }
 
