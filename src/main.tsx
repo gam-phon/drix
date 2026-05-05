@@ -6,6 +6,7 @@ import {
   EmptyState,
   FileTabsBar,
   InfoView,
+  InsightView,
   OptimizationView,
   RowDrawer,
   Sidebar,
@@ -639,10 +640,17 @@ function App() {
               ) : (
                 <EmptyState loadingStage={state.loadingStage} />
               ))}
+            {state.tab === "insight" &&
+              (activeSource ? (
+                <InsightView source={activeSource} />
+              ) : (
+                <EmptyState loadingStage={state.loadingStage} />
+              ))}
           </div>
         </main>
         {state.tab !== "info" &&
           state.tab !== "optimize" &&
+          state.tab !== "insight" &&
           (state.drawerCollapsed ? (
             <CollapseHandle side="right" onExpand={() => dispatch({ type: "TOGGLE_DRAWER" })} />
           ) : (

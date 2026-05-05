@@ -586,6 +586,14 @@ export function FileTabsBar({
         </button>
         <button
           type="button"
+          onClick={() => onTabChange("insight")}
+          className={state.tab === "insight" ? "primary" : ""}
+          style={{ borderRadius: 0, borderLeft: "none" }}
+        >
+          Insight
+        </button>
+        <button
+          type="button"
           onClick={() => onTabChange("optimize")}
           className={state.tab === "optimize" ? "primary" : ""}
           style={{ borderRadius: "0 6px 6px 0", borderLeft: "none" }}
@@ -2127,22 +2135,12 @@ export function InfoView({ source }: { source: Source }) {
       )}
 
       {!info && !error && <div style={{ color: "var(--fg-muted)" }}>loading file metadata…</div>}
-
-      <div
-        style={{
-          borderTop: "1px solid var(--border)",
-          paddingTop: 16,
-          marginTop: 8,
-        }}
-      >
-        <InsightSection source={source} />
-      </div>
     </div>
   );
 }
 
 // =========================================================================
-// Insight (rendered inside InfoView)
+// Insight tab
 // =========================================================================
 
 const FAMILY_TITLES: Record<string, string> = {
@@ -2318,7 +2316,18 @@ function BoolBar({
   );
 }
 
-function InsightSection({ source }: { source: Source }) {
+function dtypeDistribution(columns: Column[]): { label: string; count: number }[] {
+  const tally = new Map<string, number>();
+  for (const c of columns) {
+    const label = typeChipString(c.type);
+    tally.set(label, (tally.get(label) ?? 0) + 1);
+  }
+  return [...tally.entries()]
+    .map(([label, count]) => ({ label, count }))
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+}
+
+export function InsightView({ source }: { source: Source }) {
   const [entry, setEntry] = useState<InsightEntry>(() => getInsightEntry(source.alias));
   const [now, setNow] = useState(() => performance.now());
   const [glimpseRows, setGlimpseRows] = useState<Record<string, unknown>[] | null>(null);
@@ -2373,8 +2382,13 @@ function InsightSection({ source }: { source: Source }) {
     return m;
   }, [stats]);
 
+  const dtypes = useMemo(() => dtypeDistribution(source.columns), [source.columns]);
+  const nestedCount = source.columns.filter(
+    (c) => c.type.kind === "LIST" || c.type.kind === "MAP" || c.type.kind === "STRUCT",
+  ).length;
+
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+    <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 20, maxWidth: 1200 }}>
       <div
         style={{
           border: "1px solid var(--border)",
@@ -2388,8 +2402,8 @@ function InsightSection({ source }: { source: Source }) {
       >
         <div style={{ fontSize: 12, color: "var(--fg-muted)" }}>
           Statistical overview of column values — like pandas <code>describe()</code> + polars{" "}
-          <code>glimpse()</code>. The glimpse below is free; click <em>Run analysis</em> to compute
-          per-column stats and distributions.
+          <code>glimpse()</code>. Schema and a 5-row glimpse render immediately; click below to
+          compute per-column stats and distributions.
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <button type="button" className="primary" onClick={onRun} disabled={running}>
@@ -2413,6 +2427,33 @@ function InsightSection({ source }: { source: Source }) {
       </div>
 
       {error && <div style={{ color: "var(--danger)" }}>{error}</div>}
+
+      {/* Schema overview */}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+          gap: 12,
+        }}
+      >
+        <InfoCard title="Counts">
+          <KvRow k="rows" v={numberFmt.format(source.total)} />
+          <KvRow k="columns" v={numberFmt.format(source.columns.length)} />
+          <KvRow k="nested" v={numberFmt.format(nestedCount)} />
+        </InfoCard>
+        <InfoCard title={`Dtypes (${dtypes.length})`}>
+          {dtypes.length === 0 ? (
+            <span style={{ color: "var(--fg-muted)" }}>—</span>
+          ) : (
+            dtypes
+              .slice(0, 10)
+              .map((d) => <KvRow key={d.label} k={d.label} v={`× ${numberFmt.format(d.count)}`} />)
+          )}
+          {dtypes.length > 10 && (
+            <KvRow k="…" v={`+${numberFmt.format(dtypes.length - 10)} more`} />
+          )}
+        </InfoCard>
+      </div>
 
       {/* Glimpse */}
       <Section title="Glimpse (first 5 rows)">
