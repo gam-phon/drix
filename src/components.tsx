@@ -10,6 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { runQuery } from "./duckdb";
 import { formatBytes, formatRatio, numberFmt } from "./format";
 import {
   CATEGORY_LIMIT,
@@ -21,6 +22,13 @@ import {
   isFilterableSimple,
   typeChipString,
 } from "./formats/parquet";
+import type { ColumnStat, Histogram, TopK } from "./formats/parquet/insight";
+import {
+  type InsightEntry,
+  getInsightEntry,
+  startInsight,
+  subscribeInsight,
+} from "./formats/parquet/insight-store";
 import {
   type Suggestion,
   type SuggestionCategory,
@@ -575,6 +583,14 @@ export function FileTabsBar({
           style={{ borderRadius: 0, borderLeft: "none" }}
         >
           Info
+        </button>
+        <button
+          type="button"
+          onClick={() => onTabChange("insight")}
+          className={state.tab === "insight" ? "primary" : ""}
+          style={{ borderRadius: 0, borderLeft: "none" }}
+        >
+          Insight
         </button>
         <button
           type="button"
@@ -2124,6 +2140,654 @@ export function InfoView({ source }: { source: Source }) {
 }
 
 // =========================================================================
+// Insight tab
+// =========================================================================
+
+const FAMILY_TITLES: Record<string, string> = {
+  numeric: "Numeric",
+  string: "String / JSON / bytes",
+  enum: "Enum",
+  uuid: "UUID",
+  timestamp: "Timestamp",
+  date: "Date",
+  time: "Time",
+  boolean: "Boolean",
+  list: "List",
+  map: "Map",
+  struct: "Struct",
+  other: "Other",
+};
+
+const FAMILY_ORDER = [
+  "numeric",
+  "string",
+  "enum",
+  "uuid",
+  "timestamp",
+  "date",
+  "time",
+  "boolean",
+  "list",
+  "map",
+  "struct",
+  "other",
+] as const;
+
+function formatStat(n: number | undefined): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  const abs = Math.abs(n);
+  if (Number.isInteger(n) && abs < 1e15) return numberFmt.format(n);
+  if (abs >= 1e9 || (abs > 0 && abs < 1e-3)) return n.toExponential(3);
+  if (abs >= 1) return n.toFixed(Math.max(0, 4 - Math.floor(Math.log10(abs)) - 1));
+  return n.toFixed(4);
+}
+
+function formatDurationMs(ms: number | undefined): string {
+  if (ms == null || !Number.isFinite(ms) || ms <= 0) return "—";
+  const sec = ms / 1000;
+  if (sec < 60) return `${sec.toFixed(0)}s`;
+  const min = sec / 60;
+  if (min < 60) return `${min.toFixed(1)}m`;
+  const hr = min / 60;
+  if (hr < 24) return `${hr.toFixed(1)}h`;
+  const day = hr / 24;
+  if (day < 365) return `${day.toFixed(1)}d`;
+  return `${(day / 365.25).toFixed(1)}y`;
+}
+
+function shortenLabel(s: string, max = 14): string {
+  if (s.length <= max) return s;
+  return `${s.slice(0, max - 1)}…`;
+}
+
+function NullBar({
+  count,
+  nulls,
+  width = 80,
+  height = 8,
+}: {
+  count: number;
+  nulls: number;
+  width?: number;
+  height?: number;
+}) {
+  const total = count + nulls;
+  if (total <= 0) {
+    return <span style={{ color: "var(--fg-muted)", fontSize: 11 }}>—</span>;
+  }
+  const nonNullW = (count / total) * width;
+  const nullPct = ((nulls / total) * 100).toFixed(1);
+  return (
+    <svg width={width} height={height} style={{ display: "block" }}>
+      <title>{`${numberFmt.format(count)} non-null · ${numberFmt.format(nulls)} null (${nullPct}%)`}</title>
+      <rect x={0} y={0} width={width} height={height} fill="var(--bg-hover, #2a2a2a)" />
+      <rect x={0} y={0} width={nonNullW} height={height} fill="var(--accent, #4c8bf5)" />
+    </svg>
+  );
+}
+
+function HistogramSvg({
+  hist,
+  width = 120,
+  height = 32,
+}: {
+  hist: Histogram;
+  width?: number;
+  height?: number;
+}) {
+  const bins = hist.bins;
+  if (bins.length === 0) return <span style={{ color: "var(--fg-muted)", fontSize: 11 }}>—</span>;
+  const maxC = bins.reduce((m, b) => Math.max(m, b.count), 0);
+  if (maxC <= 0) return <span style={{ color: "var(--fg-muted)", fontSize: 11 }}>—</span>;
+  const w = width / bins.length;
+  const fmt =
+    hist.mode === "timeline"
+      ? (n: number) => new Date(n).toISOString().slice(0, 10)
+      : hist.mode === "hour"
+        ? (n: number) => `${Math.round(n)}h`
+        : (n: number) => formatStat(n);
+  return (
+    <svg width={width} height={height} style={{ display: "block" }} role="img">
+      <title>distribution histogram</title>
+      {bins.map((b, i) => {
+        const h = (b.count / maxC) * (height - 1);
+        return (
+          <rect
+            // biome-ignore lint/suspicious/noArrayIndexKey: bins array is rebuilt per render, order is stable
+            key={i}
+            x={i * w}
+            y={height - h}
+            width={Math.max(0, w - 1)}
+            height={h}
+            fill="var(--accent, #4c8bf5)"
+          >
+            <title>{`${fmt(b.lo)} – ${fmt(b.hi)}: ${numberFmt.format(b.count)}`}</title>
+          </rect>
+        );
+      })}
+    </svg>
+  );
+}
+
+function TopKBars({
+  items,
+  width = 160,
+  rowHeight = 11,
+}: {
+  items: TopK;
+  width?: number;
+  rowHeight?: number;
+}) {
+  if (items.length === 0) return <span style={{ color: "var(--fg-muted)", fontSize: 11 }}>—</span>;
+  const max = items.reduce((m, it) => Math.max(m, it.count), 0);
+  const labelW = 80;
+  const barW = width - labelW - 4;
+  const height = items.length * rowHeight;
+  return (
+    <svg width={width} height={height} style={{ display: "block" }} role="img">
+      <title>top values</title>
+      {items.map((it, i) => {
+        const w = max > 0 ? (it.count / max) * barW : 0;
+        return (
+          // biome-ignore lint/suspicious/noArrayIndexKey: items array is rebuilt per render, order is stable
+          <g key={i} transform={`translate(0, ${i * rowHeight})`}>
+            <text
+              x={0}
+              y={rowHeight - 2}
+              fontSize={9}
+              fill="var(--fg)"
+              style={{ fontFamily: "var(--mono)" }}
+            >
+              {shortenLabel(it.value, 12)}
+            </text>
+            <rect x={labelW} y={1} width={w} height={rowHeight - 3} fill="var(--accent, #4c8bf5)" />
+            <text
+              x={labelW + w + 2}
+              y={rowHeight - 2}
+              fontSize={9}
+              fill="var(--fg-muted)"
+              style={{ fontFamily: "var(--mono)" }}
+            >
+              {numberFmt.format(it.count)}
+            </text>
+            <title>{`${it.value}: ${numberFmt.format(it.count)}`}</title>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+function BoolBar({
+  count,
+  trueCount,
+  width = 80,
+  height = 8,
+}: {
+  count: number;
+  trueCount: number;
+  width?: number;
+  height?: number;
+}) {
+  if (count <= 0) return <span style={{ color: "var(--fg-muted)", fontSize: 11 }}>—</span>;
+  const trueW = (trueCount / count) * width;
+  const truePct = ((trueCount / count) * 100).toFixed(1);
+  const falsePct = (100 - Number(truePct)).toFixed(1);
+  return (
+    <svg width={width} height={height} style={{ display: "block" }}>
+      <title>{`true ${truePct}% · false ${falsePct}%`}</title>
+      <rect x={0} y={0} width={width} height={height} fill="var(--bg-hover, #2a2a2a)" />
+      <rect x={0} y={0} width={trueW} height={height} fill="var(--accent, #4c8bf5)" />
+    </svg>
+  );
+}
+
+function dtypeDistribution(columns: Column[]): { label: string; count: number }[] {
+  const tally = new Map<string, number>();
+  for (const c of columns) {
+    const label = typeChipString(c.type);
+    tally.set(label, (tally.get(label) ?? 0) + 1);
+  }
+  return [...tally.entries()]
+    .map(([label, count]) => ({ label, count }))
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+}
+
+export function InsightView({ source }: { source: Source }) {
+  const [entry, setEntry] = useState<InsightEntry>(() => getInsightEntry(source.alias));
+  const [now, setNow] = useState(() => performance.now());
+  const [glimpseRows, setGlimpseRows] = useState<Record<string, unknown>[] | null>(null);
+  const [glimpseError, setGlimpseError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setEntry(getInsightEntry(source.alias));
+    return subscribeInsight(source.alias, () => setEntry(getInsightEntry(source.alias)));
+  }, [source.alias]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setGlimpseRows(null);
+    setGlimpseError(null);
+    (async () => {
+      try {
+        const sql = `SELECT * FROM ${source.adapter.fromExpr(source.alias)} LIMIT 5`;
+        const { result } = await runQuery(sql);
+        if (cancelled) return;
+        setGlimpseRows(result.toArray() as Record<string, unknown>[]);
+      } catch (e) {
+        if (!cancelled) setGlimpseError((e as Error).message);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [source]);
+
+  useEffect(() => {
+    if (entry.status !== "running") return;
+    const id = window.setInterval(() => setNow(performance.now()), 500);
+    return () => window.clearInterval(id);
+  }, [entry.status]);
+
+  const onRun = useCallback(() => {
+    void startInsight(source.adapter, source.alias, source.columns);
+  }, [source]);
+
+  const stats = entry.stats;
+  const running = entry.status === "running";
+  const error = entry.error ?? glimpseError;
+
+  const grouped = useMemo(() => {
+    const m = new Map<string, ColumnStat[]>();
+    if (!stats) return m;
+    for (const s of stats) {
+      const arr = m.get(s.family) ?? [];
+      arr.push(s);
+      m.set(s.family, arr);
+    }
+    return m;
+  }, [stats]);
+
+  const dtypes = useMemo(() => dtypeDistribution(source.columns), [source.columns]);
+  const nestedCount = source.columns.filter(
+    (c) => c.type.kind === "LIST" || c.type.kind === "MAP" || c.type.kind === "STRUCT",
+  ).length;
+
+  return (
+    <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 20, maxWidth: 1200 }}>
+      <div
+        style={{
+          border: "1px solid var(--border)",
+          borderRadius: 6,
+          padding: 12,
+          background: "var(--bg-alt)",
+          display: "flex",
+          flexDirection: "column",
+          gap: 8,
+        }}
+      >
+        <div style={{ fontSize: 12, color: "var(--fg-muted)" }}>
+          Statistical overview of column values — like pandas <code>describe()</code> + polars{" "}
+          <code>glimpse()</code>. Schema and a 5-row glimpse render immediately; click below to
+          compute per-column stats and distributions.
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <button type="button" className="primary" onClick={onRun} disabled={running}>
+            {running ? "Analyzing…" : stats ? "Re-run analysis" : "Run analysis"}
+          </button>
+          {running && entry.progress && (
+            <ProgressLine
+              startedAt={entry.startedAt}
+              now={now}
+              done={entry.progress.done}
+              total={entry.progress.total}
+              phase={entry.progress.phase}
+            />
+          )}
+          {!running && entry.status === "done" && entry.startedAt && entry.finishedAt && (
+            <span style={{ color: "var(--fg-muted)", fontSize: 12 }}>
+              completed in {formatDuration(entry.finishedAt - entry.startedAt)}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {error && <div style={{ color: "var(--danger)" }}>{error}</div>}
+
+      {/* Schema overview */}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+          gap: 12,
+        }}
+      >
+        <InfoCard title="Counts">
+          <KvRow k="rows" v={numberFmt.format(source.total)} />
+          <KvRow k="columns" v={numberFmt.format(source.columns.length)} />
+          <KvRow k="nested" v={numberFmt.format(nestedCount)} />
+        </InfoCard>
+        <InfoCard title={`Dtypes (${dtypes.length})`}>
+          {dtypes.length === 0 ? (
+            <span style={{ color: "var(--fg-muted)" }}>—</span>
+          ) : (
+            dtypes
+              .slice(0, 10)
+              .map((d) => <KvRow key={d.label} k={d.label} v={`× ${numberFmt.format(d.count)}`} />)
+          )}
+          {dtypes.length > 10 && (
+            <KvRow k="…" v={`+${numberFmt.format(dtypes.length - 10)} more`} />
+          )}
+        </InfoCard>
+      </div>
+
+      {/* Glimpse */}
+      <Section title="Glimpse (first 5 rows)">
+        {glimpseRows == null && !glimpseError && (
+          <div style={{ color: "var(--fg-muted)", fontSize: 12 }}>loading…</div>
+        )}
+        {glimpseRows != null && glimpseRows.length === 0 && (
+          <div style={{ color: "var(--fg-muted)", fontSize: 12 }}>no rows</div>
+        )}
+        {glimpseRows != null && glimpseRows.length > 0 && (
+          <div style={{ overflow: "auto", border: "1px solid var(--border)", borderRadius: 6 }}>
+            <table
+              style={{
+                width: "100%",
+                borderCollapse: "collapse",
+                fontSize: 11,
+                fontFamily: "var(--mono)",
+              }}
+            >
+              <thead style={{ background: "var(--bg-alt)" }}>
+                <tr style={{ color: "var(--fg-muted)", textAlign: "left" }}>
+                  <Th>column</Th>
+                  <Th>type</Th>
+                  {glimpseRows.map((_, i) => (
+                    // biome-ignore lint/suspicious/noArrayIndexKey: glimpse rows are a frozen 5-row sample
+                    <Th key={i}>row {i + 1}</Th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {source.columns.map((c, i) => (
+                  <tr
+                    key={c.name}
+                    style={{
+                      background: i % 2 === 1 ? "var(--row-alt)" : "transparent",
+                      borderTop: "1px solid var(--border)",
+                    }}
+                  >
+                    <Td>
+                      <span style={{ fontWeight: 600 }}>{c.name}</span>
+                    </Td>
+                    <Td>
+                      <TypeChip type={c.type} noTooltip />
+                    </Td>
+                    {glimpseRows.map((row, j) => {
+                      const cell = formatCell(row[c.name], c.type);
+                      const text =
+                        cell.display === "tree"
+                          ? cell.preview
+                          : cell.display === "blob"
+                            ? `<${cell.bytes.byteLength} bytes>`
+                            : cell.text;
+                      const muted = cell.display === "muted";
+                      return (
+                        // biome-ignore lint/suspicious/noArrayIndexKey: glimpse rows are a frozen 5-row sample
+                        <Td key={j}>
+                          <span
+                            title={text}
+                            style={{
+                              color: muted ? "var(--fg-muted)" : undefined,
+                              display: "inline-block",
+                              maxWidth: 180,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                              verticalAlign: "bottom",
+                            }}
+                          >
+                            {shorten(text, 32)}
+                          </span>
+                        </Td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Section>
+
+      {/* Describe sections per family */}
+      {stats &&
+        FAMILY_ORDER.map((fam) => {
+          const items = grouped.get(fam);
+          if (!items || items.length === 0) return null;
+          return (
+            <Section key={fam} title={`${FAMILY_TITLES[fam]} (${items.length})`}>
+              <FamilyTable family={fam} stats={items} />
+            </Section>
+          );
+        })}
+    </div>
+  );
+}
+
+function FamilyTable({ family, stats }: { family: string; stats: ColumnStat[] }) {
+  const headers = familyHeaders(family);
+  return (
+    <div style={{ overflow: "auto", border: "1px solid var(--border)", borderRadius: 6 }}>
+      <table
+        style={{
+          width: "100%",
+          borderCollapse: "collapse",
+          fontSize: 11,
+          fontFamily: "var(--mono)",
+        }}
+      >
+        <thead style={{ background: "var(--bg-alt)" }}>
+          <tr style={{ color: "var(--fg-muted)", textAlign: "left" }}>
+            {headers.map((h) => (
+              <Th key={h.key} align={h.align}>
+                {h.label}
+              </Th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {stats.map((s, i) => (
+            <tr
+              key={s.name}
+              style={{
+                background: i % 2 === 1 ? "var(--row-alt)" : "transparent",
+                borderTop: "1px solid var(--border)",
+              }}
+            >
+              {renderFamilyRow(family, s)}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+type Header = { key: string; label: string; align?: "right" };
+
+function familyHeaders(family: string): Header[] {
+  const base: Header[] = [
+    { key: "name", label: "name" },
+    { key: "type", label: "type" },
+    { key: "count", label: "count", align: "right" },
+    { key: "nulls", label: "nulls", align: "right" },
+    { key: "nullbar", label: "non-null" },
+    { key: "distinct", label: "distinct", align: "right" },
+  ];
+  if (family === "numeric") {
+    return [
+      ...base,
+      { key: "mean", label: "mean", align: "right" },
+      { key: "std", label: "std", align: "right" },
+      { key: "min", label: "min", align: "right" },
+      { key: "p25", label: "p25", align: "right" },
+      { key: "p50", label: "p50", align: "right" },
+      { key: "p75", label: "p75", align: "right" },
+      { key: "max", label: "max", align: "right" },
+      { key: "dist", label: "distribution" },
+    ];
+  }
+  if (family === "string" || family === "json") {
+    return [
+      ...base,
+      { key: "minLen", label: "min len", align: "right" },
+      { key: "maxLen", label: "max len", align: "right" },
+      { key: "avgLen", label: "avg len", align: "right" },
+      { key: "min", label: "min" },
+      { key: "max", label: "max" },
+      { key: "topk", label: "top values" },
+    ];
+  }
+  if (family === "enum") {
+    return [
+      ...base,
+      { key: "min", label: "min" },
+      { key: "max", label: "max" },
+      { key: "topk", label: "top values" },
+    ];
+  }
+  if (family === "uuid") {
+    return [...base, { key: "min", label: "min" }, { key: "max", label: "max" }];
+  }
+  if (family === "timestamp" || family === "date") {
+    return [
+      ...base,
+      { key: "min", label: "min" },
+      { key: "max", label: "max" },
+      { key: "range", label: "range", align: "right" },
+      { key: "note", label: "note" },
+      { key: "dist", label: "timeline" },
+    ];
+  }
+  if (family === "time") {
+    return [
+      ...base,
+      { key: "min", label: "min" },
+      { key: "max", label: "max" },
+      { key: "dist", label: "hour distribution" },
+    ];
+  }
+  if (family === "boolean") {
+    return [
+      { key: "name", label: "name" },
+      { key: "type", label: "type" },
+      { key: "count", label: "count", align: "right" },
+      { key: "nulls", label: "nulls", align: "right" },
+      { key: "nullbar", label: "non-null" },
+      { key: "trueCount", label: "true", align: "right" },
+      { key: "trueRatio", label: "true / false" },
+    ];
+  }
+  if (family === "list" || family === "map") {
+    return [
+      { key: "name", label: "name" },
+      { key: "type", label: "type" },
+      { key: "count", label: "count", align: "right" },
+      { key: "nulls", label: "nulls", align: "right" },
+      { key: "nullbar", label: "non-null" },
+      { key: "listMin", label: "min len", align: "right" },
+      { key: "listMax", label: "max len", align: "right" },
+      { key: "listAvg", label: "avg len", align: "right" },
+    ];
+  }
+  // struct / other
+  return [
+    { key: "name", label: "name" },
+    { key: "type", label: "type" },
+    { key: "count", label: "count", align: "right" },
+    { key: "nulls", label: "nulls", align: "right" },
+    { key: "nullbar", label: "non-null" },
+  ];
+}
+
+function renderFamilyRow(family: string, s: ColumnStat) {
+  const cells: React.ReactNode[] = [];
+  const push = (key: string, node: React.ReactNode, align?: "right") =>
+    cells.push(
+      <Td key={key} align={align}>
+        {node}
+      </Td>,
+    );
+
+  push("name", <span style={{ fontWeight: 600 }}>{s.name}</span>);
+  push("type", <TypeChip type={s.type} noTooltip />);
+  push("count", numberFmt.format(s.count), "right");
+  push("nulls", numberFmt.format(s.nulls), "right");
+  push("nullbar", <NullBar count={s.count} nulls={s.nulls} />);
+
+  if (family !== "boolean" && family !== "list" && family !== "map") {
+    push("distinct", s.distinct != null ? numberFmt.format(s.distinct) : "—", "right");
+  }
+
+  if (family === "numeric") {
+    push("mean", formatStat(s.mean), "right");
+    push("std", formatStat(s.std), "right");
+    push("min", formatStat(s.numMin), "right");
+    push("p25", formatStat(s.p25), "right");
+    push("p50", formatStat(s.p50), "right");
+    push("p75", formatStat(s.p75), "right");
+    push("max", formatStat(s.numMax), "right");
+    push("dist", s.histogram ? <HistogramSvg hist={s.histogram} /> : "—");
+  } else if (family === "string" || family === "json") {
+    push("minLen", formatStat(s.minLen), "right");
+    push("maxLen", formatStat(s.maxLen), "right");
+    push("avgLen", formatStat(s.avgLen), "right");
+    push("min", <span title={s.strMin}>{shorten(s.strMin ?? "—", 16)}</span>);
+    push("max", <span title={s.strMax}>{shorten(s.strMax ?? "—", 16)}</span>);
+    push("topk", s.topK && s.topK.length > 0 ? <TopKBars items={s.topK} /> : "—");
+  } else if (family === "enum") {
+    push("min", <span title={s.strMin}>{shorten(s.strMin ?? "—", 16)}</span>);
+    push("max", <span title={s.strMax}>{shorten(s.strMax ?? "—", 16)}</span>);
+    push("topk", s.topK && s.topK.length > 0 ? <TopKBars items={s.topK} /> : "—");
+  } else if (family === "uuid") {
+    push("min", <span title={s.strMin}>{shorten(s.strMin ?? "—", 18)}</span>);
+    push("max", <span title={s.strMax}>{shorten(s.strMax ?? "—", 18)}</span>);
+  } else if (family === "timestamp" || family === "date") {
+    push("min", <span title={s.strMin}>{shorten(s.strMin ?? "—", 19)}</span>);
+    push("max", <span title={s.strMax}>{shorten(s.strMax ?? "—", 19)}</span>);
+    if (family === "timestamp") {
+      push("range", formatDurationMs(s.rangeMs), "right");
+    } else {
+      push("range", s.rangeDays != null ? `${numberFmt.format(s.rangeDays)} d` : "—", "right");
+    }
+    push("note", s.granularityNote ?? "—");
+    push("dist", s.histogram ? <HistogramSvg hist={s.histogram} /> : "—");
+  } else if (family === "time") {
+    push("min", <span title={s.strMin}>{shorten(s.strMin ?? "—", 12)}</span>);
+    push("max", <span title={s.strMax}>{shorten(s.strMax ?? "—", 12)}</span>);
+    push("dist", s.histogram ? <HistogramSvg hist={s.histogram} width={144} /> : "—");
+  } else if (family === "boolean") {
+    push("trueCount", s.trueCount != null ? numberFmt.format(s.trueCount) : "—", "right");
+    push(
+      "trueRatio",
+      s.trueCount != null && s.count > 0 ? (
+        <BoolBar count={s.count} trueCount={s.trueCount} />
+      ) : (
+        "—"
+      ),
+    );
+  } else if (family === "list" || family === "map") {
+    push("listMin", formatStat(s.listMinLen), "right");
+    push("listMax", formatStat(s.listMaxLen), "right");
+    push("listAvg", formatStat(s.listAvgLen), "right");
+  }
+
+  return cells;
+}
+
+// =========================================================================
 // Optimization tab
 // =========================================================================
 
@@ -2398,14 +3062,15 @@ function ProgressLine({
   now: number;
   done: number;
   total: number;
-  phase: "columns" | "rowgroups" | "done";
+  phase: "columns" | "rowgroups" | "charts" | "done";
 }) {
   const elapsedMs = startedAt != null ? Math.max(0, now - startedAt) : 0;
   const fraction = total > 0 ? done / total : 0;
   // ETA only after we have at least one completed probe — otherwise we'd
   // divide by zero and show a wildly wrong estimate on file open.
   const etaMs = done > 0 && fraction < 1 ? (elapsedMs / fraction) * (1 - fraction) : null;
-  const phaseLabel = phase === "rowgroups" ? "row groups" : "columns";
+  const phaseLabel =
+    phase === "rowgroups" ? "row groups" : phase === "charts" ? "distributions" : "columns";
   return (
     <div
       style={{
