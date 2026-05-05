@@ -4,6 +4,7 @@ import {
   CollapseHandle,
   DataTab,
   EmptyState,
+  FileTabsBar,
   InfoView,
   OptimizationView,
   RowDrawer,
@@ -526,7 +527,6 @@ function App() {
       {(state.loading || state.loadingStage) && <div className="drix-progress" />}
       <TopBar
         state={state}
-        onTabChange={(tab) => dispatch({ type: "SET_TAB", tab })}
         onTheme={() =>
           dispatch({ type: "SET_THEME", theme: state.theme === "dark" ? "light" : "dark" })
         }
@@ -587,32 +587,47 @@ function App() {
             }}
           />
         )}
-        <main style={{ overflow: "auto", borderLeft: "1px solid var(--border)" }}>
-          {state.tab === "data" ? (
-            activeSource ? (
-              <DataTab
-                state={state}
-                dispatch={dispatch}
-                source={activeSource}
-                openFilter={openFilter}
-                setOpenFilter={setOpenFilter}
-              />
+        <main
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            overflow: "hidden",
+            borderLeft: "1px solid var(--border)",
+            minHeight: 0,
+          }}
+        >
+          <FileTabsBar
+            state={state}
+            source={activeSource}
+            onTabChange={(tab) => dispatch({ type: "SET_TAB", tab })}
+          />
+          <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
+            {state.tab === "data" ? (
+              activeSource ? (
+                <DataTab
+                  state={state}
+                  dispatch={dispatch}
+                  source={activeSource}
+                  openFilter={openFilter}
+                  setOpenFilter={setOpenFilter}
+                />
+              ) : (
+                <EmptyState loadingStage={state.loadingStage} />
+              )
+            ) : state.tab === "sql" ? (
+              <SqlView state={state} dispatch={dispatch} runSql={runSql} />
+            ) : state.tab === "optimize" ? (
+              activeSource ? (
+                <OptimizationView source={activeSource} />
+              ) : (
+                <EmptyState loadingStage={state.loadingStage} />
+              )
+            ) : activeSource ? (
+              <InfoView source={activeSource} />
             ) : (
               <EmptyState loadingStage={state.loadingStage} />
-            )
-          ) : state.tab === "sql" ? (
-            <SqlView state={state} dispatch={dispatch} runSql={runSql} />
-          ) : state.tab === "optimize" ? (
-            activeSource ? (
-              <OptimizationView source={activeSource} />
-            ) : (
-              <EmptyState loadingStage={state.loadingStage} />
-            )
-          ) : activeSource ? (
-            <InfoView source={activeSource} />
-          ) : (
-            <EmptyState loadingStage={state.loadingStage} />
-          )}
+            )}
+          </div>
         </main>
         {state.tab !== "info" &&
           state.tab !== "optimize" &&

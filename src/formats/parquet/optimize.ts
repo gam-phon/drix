@@ -347,6 +347,40 @@ function buildTypeSuggestion(col: Column, probe: ColumnProbe): Suggestion | null
           "Every sampled value starts with { or [; tagging the column JSON lets readers parse it natively.",
       };
     }
+    // Categorical fit: many repeats of a small set of distinct values. Suggest
+    // an enum/categorical dtype at the writer level so the values list is
+    // captured in schema metadata (not just dictionary-encoded at the page
+    // level). Estimate savings from the cardinality ratio against the column's
+    // current uncompressed size.
+    if (
+      probe.distinct != null &&
+      probe.distinct > 0 &&
+      probe.numValues != null &&
+      probe.numValues > 0
+    ) {
+      const ratio = probe.distinct / probe.numValues;
+      const isLowCardinality = ratio < 0.05 || probe.distinct < 100;
+      const hasRepetition = probe.numValues >= probe.distinct * 10;
+      if (isLowCardinality && hasRepetition) {
+        const m = pmeta(col);
+        const uncompressed = m?.totalUncompressedSize ?? 0;
+        const estSavings = uncompressed > 0 ? Math.round(uncompressed * (1 - ratio) * 0.7) : 0;
+        const dictAlready = (m?.encodings ?? "").toUpperCase().includes("DICTIONARY");
+        return {
+          id: `type:${col.name}`,
+          category: "type",
+          severity: dictAlready ? "low" : "medium",
+          column: col.name,
+          title: dictAlready
+            ? "Tag as enum / categorical (already dictionary-encoded)"
+            : "Encode as enum / categorical",
+          current: cur,
+          suggested: "ENUM",
+          reason: `Only ${probe.distinct.toLocaleString()} distinct values across ${probe.numValues.toLocaleString()} rows (${(ratio * 100).toFixed(2)}% cardinality). Polars: \`pl.Enum(["…"])\` · Pandas: \`df["${col.name}"].astype("category")\` · PyArrow: \`pa.dictionary(pa.int32(), pa.string())\`. ${dictAlready ? "Dictionary encoding is already on; using a true enum dtype additionally records the value list in schema metadata for downstream readers." : "Without an enum/categorical dtype, each row stores the full string and dictionary encoding may not kick in."}`,
+          estSavingsBytes: estSavings > 0 ? estSavings : undefined,
+        };
+      }
+    }
     if (
       probe.strMinLen != null &&
       probe.strMaxLen != null &&
@@ -806,21 +840,38 @@ const CATEGORY_ORDER: Record<SuggestionCategory, number> = {
 // Public entry point
 // ------------------------------------------------------------------
 
+export type AnalyzeProgress = {
+  done: number;
+  total: number;
+  phase: "columns" | "rowgroups" | "done";
+};
+
 export async function analyzeParquet(
   adapter: FormatAdapter,
   alias: string,
   columns: Column[],
   info: ParquetFileInfo,
+  onProgress?: (p: AnalyzeProgress) => void,
 ): Promise<Suggestion[]> {
   const probesByColumn = new Map<string, ColumnProbe | null>();
+  const total = columns.length;
+  onProgress?.({ done: 0, total, phase: "columns" });
 
   // Run per-column probes in parallel; DuckDB streams parquet column-by-column
-  // so concurrent aggregates don't multiply IO.
+  // so concurrent aggregates don't multiply IO. Each completion bumps the
+  // progress counter so the UI can extrapolate an ETA.
+  let done = 0;
   const probeResults = await Promise.all(
-    columns.map(async (c) => [c.name, await runColumnProbe(adapter, alias, c)] as const),
+    columns.map(async (c) => {
+      const p = await runColumnProbe(adapter, alias, c);
+      done++;
+      onProgress?.({ done, total, phase: "columns" });
+      return [c.name, p] as const;
+    }),
   );
   for (const [name, p] of probeResults) probesByColumn.set(name, p);
 
+  onProgress?.({ done: total, total, phase: "rowgroups" });
   const rgStats = await fetchRowGroupStats(alias, columns);
 
   const suggestions: Suggestion[] = [];
@@ -848,5 +899,6 @@ export async function analyzeParquet(
     if (c !== 0) return c;
     return SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity];
   });
+  onProgress?.({ done: total, total, phase: "done" });
   return suggestions;
 }

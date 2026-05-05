@@ -20,11 +20,13 @@ import {
   isFilterableSimple,
   typeChipString,
 } from "./formats/parquet";
+import type { Suggestion, SuggestionCategory } from "./formats/parquet/optimize";
 import {
-  type Suggestion,
-  type SuggestionCategory,
-  analyzeParquet,
-} from "./formats/parquet/optimize";
+  type OptimizeEntry,
+  getOptimizeEntry,
+  startOptimize,
+  subscribeOptimize,
+} from "./formats/parquet/optimize-store";
 import type { ParquetFileInfo, ParquetMeta } from "./formats/parquet/types";
 import type { Action, Column, FilterOp, FilterValue, SortEntry, Source, State } from "./types";
 
@@ -434,12 +436,10 @@ const TypeChip = memo(function TypeChip({
 
 export function TopBar({
   state,
-  onTabChange,
   onTheme,
   onExport,
 }: {
   state: State;
-  onTabChange: (t: "data" | "sql" | "info" | "optimize") => void;
   onTheme: () => void;
   onExport: () => void;
 }) {
@@ -460,40 +460,6 @@ export function TopBar({
           Drix Viewer{" "}
           <span style={{ color: "var(--fg-muted)", fontWeight: 400, fontSize: 12 }}>parquet</span>
         </div>
-      </div>
-      <div style={{ display: "flex", gap: 0, marginLeft: 12 }}>
-        <button
-          type="button"
-          onClick={() => onTabChange("data")}
-          className={state.tab === "data" ? "primary" : ""}
-          style={{ borderRadius: "6px 0 0 6px" }}
-        >
-          Data
-        </button>
-        <button
-          type="button"
-          onClick={() => onTabChange("sql")}
-          className={state.tab === "sql" ? "primary" : ""}
-          style={{ borderRadius: 0, borderLeft: "none" }}
-        >
-          SQL
-        </button>
-        <button
-          type="button"
-          onClick={() => onTabChange("info")}
-          className={state.tab === "info" ? "primary" : ""}
-          style={{ borderRadius: 0, borderLeft: "none" }}
-        >
-          Info
-        </button>
-        <button
-          type="button"
-          onClick={() => onTabChange("optimize")}
-          className={state.tab === "optimize" ? "primary" : ""}
-          style={{ borderRadius: "0 6px 6px 0", borderLeft: "none" }}
-        >
-          Optimize
-        </button>
       </div>
       <div style={{ flex: 1 }} />
       <button type="button" onClick={onTheme} title="Toggle theme">
@@ -549,6 +515,91 @@ export function TopBar({
         </svg>
       </a>
     </header>
+  );
+}
+
+// =========================================================================
+// File context + tabs bar
+// =========================================================================
+
+// Sits at the top of <main>. Tabs row above; active-source name + rows · cols
+// directly below. Replaces the per-tab file headers that used to live inside
+// DataTab / InfoView / OptimizationView.
+export function FileTabsBar({
+  state,
+  source,
+  onTabChange,
+}: {
+  state: State;
+  source: Source | null;
+  onTabChange: (t: State["tab"]) => void;
+}) {
+  return (
+    <div
+      style={{
+        borderBottom: "1px solid var(--border)",
+        background: "var(--bg-alt)",
+        padding: "8px 12px",
+        display: "flex",
+        flexDirection: "column",
+        gap: 6,
+      }}
+    >
+      <div style={{ display: "flex", gap: 0 }}>
+        <button
+          type="button"
+          onClick={() => onTabChange("data")}
+          className={state.tab === "data" ? "primary" : ""}
+          style={{ borderRadius: "6px 0 0 6px" }}
+        >
+          Data
+        </button>
+        <button
+          type="button"
+          onClick={() => onTabChange("sql")}
+          className={state.tab === "sql" ? "primary" : ""}
+          style={{ borderRadius: 0, borderLeft: "none" }}
+        >
+          SQL
+        </button>
+        <button
+          type="button"
+          onClick={() => onTabChange("info")}
+          className={state.tab === "info" ? "primary" : ""}
+          style={{ borderRadius: 0, borderLeft: "none" }}
+        >
+          Info
+        </button>
+        <button
+          type="button"
+          onClick={() => onTabChange("optimize")}
+          className={state.tab === "optimize" ? "primary" : ""}
+          style={{ borderRadius: "0 6px 6px 0", borderLeft: "none" }}
+        >
+          Optimize
+        </button>
+      </div>
+      {source && (
+        <div style={{ display: "flex", alignItems: "baseline", gap: 12, minWidth: 0 }}>
+          <span
+            style={{
+              fontWeight: 600,
+              fontSize: 14,
+              fontFamily: "var(--mono)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+            title={source.displayName}
+          >
+            {source.displayName}
+          </span>
+          <span style={{ color: "var(--fg-muted)", fontSize: 12, whiteSpace: "nowrap" }}>
+            {numberFmt.format(source.total)} rows · {numberFmt.format(source.columns.length)} cols
+          </span>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -833,32 +884,25 @@ const DataRow = memo(function DataRow({ row, rowIdx, isSelected, isOdd, onSelect
 });
 
 // Scrolls the grid one column left (-1) or right (+1) using the live thead
-// offsets. Reading offsets each call keeps it correct under hide/reorder/resize.
+// offsets. Always advances by exactly one column — even when many columns fit
+// in the viewport — by anchoring on whichever column is currently flush with
+// the left edge and moving to its neighbour.
 function scrollByColumn(container: HTMLDivElement | null, dir: 1 | -1) {
   if (!container) return;
   const ths = container.querySelectorAll<HTMLTableCellElement>("thead th");
   if (ths.length === 0) return;
   const left = container.scrollLeft;
-  const right = left + container.clientWidth;
-  let target: number | null = null;
-  if (dir === 1) {
-    // First column whose right edge is past the viewport's right edge.
-    for (const th of ths) {
-      const colRight = th.offsetLeft + th.offsetWidth;
-      if (colRight > right + 1) {
-        target = th.offsetLeft;
-        break;
-      }
-    }
-  } else {
-    // Last column whose left edge is before the viewport's left edge.
-    for (const th of ths) {
-      if (th.offsetLeft < left - 1) target = th.offsetLeft;
-      else break;
-    }
+  let leadIdx = 0;
+  for (let i = 0; i < ths.length; i++) {
+    if (ths[i].offsetLeft <= left + 1) leadIdx = i;
+    else break;
   }
-  if (target == null) return;
-  container.scrollTo({ left: Math.max(0, target), behavior: "smooth" });
+  const targetIdx = leadIdx + dir;
+  if (targetIdx < 0 || targetIdx >= ths.length) return;
+  container.scrollTo({
+    left: Math.max(0, ths[targetIdx].offsetLeft),
+    behavior: "smooth",
+  });
 }
 
 function DataGrid({
@@ -1428,12 +1472,6 @@ export function DataTab({
 
   return (
     <div style={{ padding: 12, display: "flex", flexDirection: "column", gap: 8, height: "100%" }}>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
-        <h2 style={{ margin: 0, fontSize: 14 }}>{source.displayName}</h2>
-        <span style={{ color: "var(--fg-muted)", fontSize: 12 }}>
-          {numberFmt.format(source.total)} rows · {numberFmt.format(source.columns.length)} cols
-        </span>
-      </div>
       {state.quickFilterOpen ? (
         <QuickFilter
           value={state.globalFilter}
@@ -1822,20 +1860,6 @@ export function InfoView({ source }: { source: Source }) {
 
   return (
     <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 20, maxWidth: 1100 }}>
-      <div>
-        <h2
-          style={{
-            margin: 0,
-            fontSize: 18,
-            fontFamily: "var(--mono)",
-            wordBreak: "break-all",
-          }}
-        >
-          {source.displayName}
-        </h2>
-        <div style={{ color: "var(--fg-muted)", fontSize: 12, marginTop: 2 }}>{source.alias}</div>
-      </div>
-
       {error && <div style={{ color: "var(--danger)" }}>{error}</div>}
 
       {/* Overview cards */}
@@ -2096,42 +2120,54 @@ const SUGGESTION_GROUP_ORDER: SuggestionCategory[] = [
 
 export function OptimizationView({ source }: { source: Source }) {
   const [info, setInfo] = useState<ParquetFileInfo | null>(null);
-  const [suggestions, setSuggestions] = useState<Suggestion[] | null>(null);
-  const [running, setRunning] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [infoError, setInfoError] = useState<string | null>(null);
+  // The analysis state lives in a module-level store keyed by alias, so
+  // unmounting (when the user switches tabs) doesn't drop in-flight progress
+  // or completed results. We mirror it here just to trigger re-renders.
+  const [entry, setEntry] = useState<OptimizeEntry>(() => getOptimizeEntry(source.alias));
+  // `now` is a re-render heartbeat used to recompute elapsed/ETA every second
+  // while analysis is running.
+  const [now, setNow] = useState(() => performance.now());
 
-  // Reset on source change so a new file shows the unrun state.
+  useEffect(() => {
+    setEntry(getOptimizeEntry(source.alias));
+    return subscribeOptimize(source.alias, () => {
+      setEntry(getOptimizeEntry(source.alias));
+    });
+  }, [source.alias]);
+
   useEffect(() => {
     let cancelled = false;
     setInfo(null);
-    setSuggestions(null);
-    setError(null);
+    setInfoError(null);
     source.adapter
       .fetchFileInfo(source.alias, source.fileSizeBytes)
       .then((i) => {
         if (!cancelled) setInfo(i as ParquetFileInfo | null);
       })
       .catch((e) => {
-        if (!cancelled) setError((e as Error).message);
+        if (!cancelled) setInfoError((e as Error).message);
       });
     return () => {
       cancelled = true;
     };
   }, [source]);
 
-  const onRun = useCallback(async () => {
+  // Tick `now` while running so the elapsed/ETA display updates live.
+  useEffect(() => {
+    if (entry.status !== "running") return;
+    const id = window.setInterval(() => setNow(performance.now()), 500);
+    return () => window.clearInterval(id);
+  }, [entry.status]);
+
+  const onRun = useCallback(() => {
     if (!info) return;
-    setRunning(true);
-    setError(null);
-    try {
-      const out = await analyzeParquet(source.adapter, source.alias, source.columns, info);
-      setSuggestions(out);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setRunning(false);
-    }
+    void startOptimize(source.adapter, source.alias, source.columns, info);
   }, [info, source]);
+
+  const suggestions = entry.suggestions;
+  const running = entry.status === "running";
+  const error = entry.error ?? infoError;
 
   const grouped = useMemo(() => {
     const m = new Map<SuggestionCategory, Suggestion[]>();
@@ -2161,22 +2197,6 @@ export function OptimizationView({ source }: { source: Source }) {
 
   return (
     <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 20, maxWidth: 1100 }}>
-      <div>
-        <h2
-          style={{
-            margin: 0,
-            fontSize: 18,
-            fontFamily: "var(--mono)",
-            wordBreak: "break-all",
-          }}
-        >
-          {source.displayName}
-        </h2>
-        <div style={{ color: "var(--fg-muted)", fontSize: 12, marginTop: 2 }}>
-          Optimization analysis · {source.alias}
-        </div>
-      </div>
-
       <div
         style={{
           border: "1px solid var(--border)",
@@ -2192,12 +2212,26 @@ export function OptimizationView({ source }: { source: Source }) {
           Deep-scans every column to suggest tighter types, better compression codecs and encodings,
           bloom filters, and row-group sort keys. Read-only — no file is modified.
         </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <button type="button" className="primary" onClick={onRun} disabled={!info || running}>
             {running ? "Analyzing…" : suggestions ? "Re-run analysis" : "Run analysis"}
           </button>
           {!info && !error && (
             <span style={{ color: "var(--fg-muted)", fontSize: 12 }}>loading file metadata…</span>
+          )}
+          {running && (
+            <ProgressLine
+              startedAt={entry.startedAt}
+              now={now}
+              done={entry.progress?.done ?? 0}
+              total={entry.progress?.total ?? source.columns.length}
+              phase={entry.progress?.phase ?? "columns"}
+            />
+          )}
+          {!running && entry.status === "done" && entry.startedAt && entry.finishedAt && (
+            <span style={{ color: "var(--fg-muted)", fontSize: 12 }}>
+              completed in {formatDuration(entry.finishedAt - entry.startedAt)}
+            </span>
           )}
         </div>
       </div>
@@ -2314,6 +2348,82 @@ export function OptimizationView({ source }: { source: Source }) {
         })}
     </div>
   );
+}
+
+function ProgressLine({
+  startedAt,
+  now,
+  done,
+  total,
+  phase,
+}: {
+  startedAt: number | null;
+  now: number;
+  done: number;
+  total: number;
+  phase: "columns" | "rowgroups" | "done";
+}) {
+  const elapsedMs = startedAt != null ? Math.max(0, now - startedAt) : 0;
+  const fraction = total > 0 ? done / total : 0;
+  // ETA only after we have at least one completed probe — otherwise we'd
+  // divide by zero and show a wildly wrong estimate on file open.
+  const etaMs = done > 0 && fraction < 1 ? (elapsedMs / fraction) * (1 - fraction) : null;
+  const phaseLabel = phase === "rowgroups" ? "row groups" : "columns";
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+        fontSize: 12,
+        flex: 1,
+        minWidth: 240,
+      }}
+    >
+      <div
+        style={{
+          color: "var(--fg-muted)",
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 12,
+        }}
+      >
+        <span>
+          analyzing {phaseLabel} · {done.toLocaleString()} / {total.toLocaleString()}
+        </span>
+        <span>
+          {formatDuration(elapsedMs)} elapsed
+          {etaMs != null ? ` · ~${formatDuration(etaMs)} remaining` : ""}
+        </span>
+      </div>
+      <div
+        style={{
+          height: 4,
+          background: "var(--border)",
+          borderRadius: 2,
+          overflow: "hidden",
+        }}
+      >
+        <div
+          style={{
+            width: `${Math.min(100, Math.round(fraction * 100))}%`,
+            height: "100%",
+            background: "var(--chip-fg, #4c8bf5)",
+            transition: "width 200ms linear",
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function formatDuration(ms: number): string {
+  const safe = Number.isFinite(ms) && ms > 0 ? ms : 0;
+  const totalSec = Math.round(safe / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
 }
 
 function SeverityChip({ severity }: { severity: Suggestion["severity"] }) {
