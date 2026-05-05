@@ -11,7 +11,32 @@ function asNumber(v: unknown): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
-export async function fetchParquetFileInfo(
+// Per-alias cache. fetchParquetFileInfo issues 3 metadata queries that can
+// run for many seconds on wide files (thousands of columns), and InfoView /
+// OptimizationView each call it on mount. Caching lets re-entering a tab
+// reuse the in-flight (or completed) Promise instead of queueing fresh
+// queries behind whatever else is using the single DuckDB connection.
+const infoCache = new Map<string, Promise<ParquetFileInfo>>();
+
+export function invalidateParquetFileInfo(alias: string) {
+  infoCache.delete(alias);
+}
+
+export function fetchParquetFileInfo(
+  alias: string,
+  fileSizeBytes: number,
+): Promise<ParquetFileInfo> {
+  const cached = infoCache.get(alias);
+  if (cached) return cached;
+  const promise = fetchParquetFileInfoUncached(alias, fileSizeBytes).catch((e) => {
+    infoCache.delete(alias);
+    throw e;
+  });
+  infoCache.set(alias, promise);
+  return promise;
+}
+
+async function fetchParquetFileInfoUncached(
   alias: string,
   fileSizeBytes: number,
 ): Promise<ParquetFileInfo> {

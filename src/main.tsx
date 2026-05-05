@@ -548,7 +548,12 @@ function App() {
           display: "grid",
           gridTemplateColumns: (() => {
             const sidebar = state.sidebarCollapsed ? "32px " : "240px ";
-            const drawer = state.tab === "info" ? "" : state.drawerCollapsed ? " 32px" : " 320px";
+            const drawer =
+              state.tab === "info" || state.tab === "optimize"
+                ? ""
+                : state.drawerCollapsed
+                  ? " 32px"
+                  : " 320px";
             return `${sidebar}1fr${drawer}`;
           })(),
           overflow: "hidden",
@@ -602,8 +607,16 @@ function App() {
             onTabChange={(tab) => dispatch({ type: "SET_TAB", tab })}
           />
           <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
-            {state.tab === "data" ? (
-              activeSource ? (
+            {/* DataTab stays mounted across tab switches so TanStack table,
+                virtualizer, and scroll position survive — re-mounting on every
+                return is what made wide tables feel slow on tab switch. */}
+            {activeSource && (
+              <div
+                style={{
+                  display: state.tab === "data" ? "block" : "none",
+                  height: "100%",
+                }}
+              >
                 <DataTab
                   state={state}
                   dispatch={dispatch}
@@ -611,22 +624,24 @@ function App() {
                   openFilter={openFilter}
                   setOpenFilter={setOpenFilter}
                 />
+              </div>
+            )}
+            {state.tab === "data" && !activeSource && (
+              <EmptyState loadingStage={state.loadingStage} />
+            )}
+            {state.tab === "sql" && <SqlView state={state} dispatch={dispatch} runSql={runSql} />}
+            {state.tab === "info" &&
+              (activeSource ? (
+                <InfoView source={activeSource} />
               ) : (
                 <EmptyState loadingStage={state.loadingStage} />
-              )
-            ) : state.tab === "sql" ? (
-              <SqlView state={state} dispatch={dispatch} runSql={runSql} />
-            ) : state.tab === "optimize" ? (
-              activeSource ? (
+              ))}
+            {state.tab === "optimize" &&
+              (activeSource ? (
                 <OptimizationView source={activeSource} />
               ) : (
                 <EmptyState loadingStage={state.loadingStage} />
-              )
-            ) : activeSource ? (
-              <InfoView source={activeSource} />
-            ) : (
-              <EmptyState loadingStage={state.loadingStage} />
-            )}
+              ))}
           </div>
         </main>
         {state.tab !== "info" &&

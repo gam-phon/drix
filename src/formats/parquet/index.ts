@@ -6,7 +6,7 @@ export {
   fetchCategories,
   isCategoricalCandidate,
 } from "./categories";
-export { fetchParquetFileInfo } from "./file-info";
+export { fetchParquetFileInfo, invalidateParquetFileInfo } from "./file-info";
 export { type FormatResult, formatCell } from "./format";
 export { castExpr, isFilterableSimple, parseParquetType, typeChipString } from "./parser";
 export { fetchParquetSchema } from "./schema";

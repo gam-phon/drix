@@ -17,6 +17,7 @@ import {
   type ParquetType,
   fetchAllCategoricalColumns,
   formatCell,
+  invalidateParquetFileInfo,
   isFilterableSimple,
   typeChipString,
 } from "./formats/parquet";
@@ -24,6 +25,7 @@ import type { Suggestion, SuggestionCategory } from "./formats/parquet/optimize"
 import {
   type OptimizeEntry,
   getOptimizeEntry,
+  resetOptimize,
   startOptimize,
   subscribeOptimize,
 } from "./formats/parquet/optimize-store";
@@ -768,7 +770,11 @@ export function Sidebar({
             </button>
             <button
               type="button"
-              onClick={() => dispatch({ type: "REMOVE_SOURCE", alias: s.alias })}
+              onClick={() => {
+                invalidateParquetFileInfo(s.alias);
+                resetOptimize(s.alias);
+                dispatch({ type: "REMOVE_SOURCE", alias: s.alias });
+              }}
               title="Close file"
               style={{
                 background: "transparent",
