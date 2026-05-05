@@ -55,17 +55,26 @@ function formatTime(value: bigint | number, tz: boolean): string {
 }
 
 function formatDate(value: unknown): string {
+  if (value == null) return "";
   if (value instanceof Date) {
-    return `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1, 2)}-${pad(
-      value.getUTCDate(),
-      2,
-    )}`;
+    if (Number.isFinite(value.getTime())) {
+      return `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1, 2)}-${pad(
+        value.getUTCDate(),
+        2,
+      )}`;
+    }
+    return String(value);
   }
-  if (typeof value === "number") {
-    return formatDate(new Date(value * 86400000));
+  if (typeof value === "string") return value;
+  // Apache Arrow's DateDay/DateMillisecond getter already converts to
+  // milliseconds-since-epoch — it does the days × 86_400_000 multiplication
+  // for us. Multiplying again here is what made dates render as NaN-NaN-NaN.
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return formatDate(new Date(value));
   }
   if (typeof value === "bigint") {
-    return formatDate(new Date(Number(value) * 86400000));
+    const n = Number(value);
+    if (Number.isFinite(n)) return formatDate(new Date(n));
   }
   return String(value);
 }

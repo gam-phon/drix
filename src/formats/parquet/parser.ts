@@ -212,8 +212,14 @@ function unquoteIdent(s: string): string {
   return s;
 }
 
-// Renders the parquet-flavoured type label for a column.
-export function typeChipString(t: ParquetType): string {
+// Renders the parquet-flavoured type label for a column. `maxDepth` caps how
+// deep we recurse into nested STRUCT/LIST/MAP — the chip in the table header
+// uses depth 1 so deeply nested structs don't blow up into 5000-char strings.
+export function typeChipString(t: ParquetType, opts?: { maxDepth?: number }): string {
+  return formatType(t, 0, opts?.maxDepth ?? Number.POSITIVE_INFINITY);
+}
+
+function formatType(t: ParquetType, depth: number, maxDepth: number): string {
   switch (t.kind) {
     case "BOOLEAN":
       return "BOOLEAN";
@@ -252,11 +258,18 @@ export function typeChipString(t: ParquetType): string {
     case "ENUM":
       return "ENUM";
     case "LIST":
-      return `LIST<${typeChipString(t.element)}>`;
+      if (depth >= maxDepth) return "LIST<…>";
+      return `LIST<${formatType(t.element, depth + 1, maxDepth)}>`;
     case "MAP":
-      return `MAP<${typeChipString(t.key)}, ${typeChipString(t.value)}>`;
-    case "STRUCT":
-      return `STRUCT<${t.fields.map((f) => `${f.name}: ${typeChipString(f.type)}`).join(", ")}>`;
+      if (depth >= maxDepth) return "MAP<…>";
+      return `MAP<${formatType(t.key, depth + 1, maxDepth)}, ${formatType(t.value, depth + 1, maxDepth)}>`;
+    case "STRUCT": {
+      if (depth >= maxDepth) {
+        const n = t.fields.length;
+        return `STRUCT<${n} field${n === 1 ? "" : "s"}>`;
+      }
+      return `STRUCT<${t.fields.map((f) => `${f.name}: ${formatType(f.type, depth + 1, maxDepth)}`).join(", ")}>`;
+    }
     default:
       return t.raw;
   }

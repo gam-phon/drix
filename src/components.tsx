@@ -1,5 +1,6 @@
 import { type ColumnDef, flexRender, getCoreRowModel, useReactTable } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { type Schema as ArrowSchema, MessageHeader, MessageReader } from "apache-arrow";
 import {
   type CSSProperties,
   type Dispatch,
@@ -339,6 +340,46 @@ function FilterPopover({
 // Type chip
 // =========================================================================
 
+// Renders a parquet type as an indented multi-line tree. Used inside the
+// click-pinned popover from TypeChip — flat row per primitive leaf, headers
+// for STRUCT / LIST / MAP that recurse into their children.
+function TypeTree({ type }: { type: ParquetType }) {
+  type Line = { depth: number; name?: string; label: string; muted?: boolean };
+  const lines: Line[] = [];
+  const walk = (t: ParquetType, depth: number, name?: string) => {
+    if (t.kind === "STRUCT") {
+      lines.push({ depth, name, label: `STRUCT (${t.fields.length})`, muted: true });
+      for (const f of t.fields) walk(f.type, depth + 1, f.name);
+    } else if (t.kind === "LIST") {
+      lines.push({ depth, name, label: "LIST", muted: true });
+      walk(t.element, depth + 1, "(item)");
+    } else if (t.kind === "MAP") {
+      lines.push({ depth, name, label: "MAP", muted: true });
+      walk(t.key, depth + 1, "(key)");
+      walk(t.value, depth + 1, "(value)");
+    } else {
+      lines.push({ depth, name, label: typeChipString(t) });
+    }
+  };
+  walk(type, 0);
+  return (
+    <div style={{ fontFamily: "var(--mono)", fontSize: 11, lineHeight: 1.5 }}>
+      {lines.map((l, i) => (
+        <div
+          // biome-ignore lint/suspicious/noArrayIndexKey: type tree is rebuilt per render, order is stable
+          key={i}
+          style={{ paddingLeft: l.depth * 14, whiteSpace: "nowrap" }}
+        >
+          {l.name != null && <span style={{ color: "var(--fg)" }}>{l.name}: </span>}
+          <span style={{ color: l.muted ? "var(--fg-muted)" : "var(--chip-fg, #4c8bf5)" }}>
+            {l.label}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 const TypeChip = memo(function TypeChip({
   type,
   parquet,
@@ -349,11 +390,51 @@ const TypeChip = memo(function TypeChip({
   noTooltip?: boolean;
 }) {
   const [hover, setHover] = useState(false);
-  const label = useMemo(() => typeChipString(type), [type]);
+  const [pinned, setPinned] = useState(false);
+  const ref = useRef<HTMLSpanElement | null>(null);
+  // Display label caps recursion depth so a deeply nested STRUCT doesn't blow
+  // up into a 5000-char header. Full structure goes in the click-pinned popover.
+  const label = useMemo(() => typeChipString(type, { maxDepth: 1 }), [type]);
+  const fullLabel = useMemo(() => typeChipString(type), [type]);
+  const isNested = type.kind === "STRUCT" || type.kind === "LIST" || type.kind === "MAP";
+  const hasMeta = !!parquet && Object.values(parquet).some((v) => v != null);
+  const open = !noTooltip && (pinned || hover) && (isNested || hasMeta);
+
+  // Close pinned popover on outside click — common pattern, use document
+  // listener with ref guard so clicks inside the popover stay open.
+  useEffect(() => {
+    if (!pinned) return;
+    const onDoc = (e: MouseEvent) => {
+      if (!ref.current) return;
+      if (!ref.current.contains(e.target as Node)) setPinned(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [pinned]);
+
+  const onClick = (e: React.MouseEvent) => {
+    if (noTooltip || (!isNested && !hasMeta)) return;
+    e.stopPropagation();
+    setPinned((p) => !p);
+  };
+
   return (
     <span
+      ref={ref}
       onMouseEnter={() => !noTooltip && setHover(true)}
       onMouseLeave={() => setHover(false)}
+      onClick={onClick}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick(e as unknown as React.MouseEvent);
+        } else if (e.key === "Escape" && pinned) {
+          setPinned(false);
+        }
+      }}
+      role={isNested || hasMeta ? "button" : undefined}
+      tabIndex={isNested || hasMeta ? 0 : undefined}
+      title={!pinned && fullLabel !== label ? fullLabel : undefined}
       style={{
         display: "inline-block",
         background: "var(--chip-bg)",
@@ -363,13 +444,19 @@ const TypeChip = memo(function TypeChip({
         borderRadius: 999,
         fontFamily: "var(--mono)",
         position: "relative",
-        cursor: "default",
+        cursor: isNested || hasMeta ? "pointer" : "default",
         whiteSpace: "nowrap",
+        maxWidth: 320,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        verticalAlign: "middle",
       }}
     >
       {label}
-      {hover && !noTooltip && parquet && Object.values(parquet).some((v) => v != null) && (
+      {isNested && <span style={{ marginLeft: 4, opacity: 0.7 }}>{pinned ? "▴" : "▾"}</span>}
+      {open && (
         <span
+          onMouseDown={(e) => e.stopPropagation()}
           style={{
             position: "absolute",
             top: "calc(100% + 4px)",
@@ -384,58 +471,78 @@ const TypeChip = memo(function TypeChip({
             fontFamily: "var(--mono)",
             color: "var(--fg)",
             display: "block",
-            minWidth: 200,
+            minWidth: 240,
+            maxWidth: 520,
+            maxHeight: 480,
+            overflow: "auto",
+            whiteSpace: "normal",
+            wordBreak: "break-word",
+            cursor: "default",
           }}
         >
-          <div style={{ fontWeight: 600, marginBottom: 4 }}>schema</div>
-          {parquet.physical && <div>physical: {parquet.physical}</div>}
-          {parquet.typeLength != null && <div>type_length: {parquet.typeLength}</div>}
-          {parquet.repetition && <div>repetition: {parquet.repetition}</div>}
-          {parquet.convertedType && <div>converted: {parquet.convertedType}</div>}
-          {parquet.logicalType && <div>logical: {parquet.logicalType}</div>}
-          {parquet.precision != null && <div>precision: {parquet.precision}</div>}
-          {parquet.scale != null && <div>scale: {parquet.scale}</div>}
-          {parquet.fieldId != null && <div>field_id: {parquet.fieldId}</div>}
-          {parquet.pathInSchema && parquet.pathInSchema.length > 0 && (
-            <div>path: {parquet.pathInSchema.join(".")}</div>
-          )}
-          {(parquet.compression || parquet.encodings || parquet.totalCompressedSize != null) && (
+          {isNested && (
             <>
-              <div style={{ fontWeight: 600, marginTop: 6, marginBottom: 4 }}>storage</div>
-              {parquet.compression && <div>compression: {parquet.compression}</div>}
-              {parquet.encodings && <div>encodings: {parquet.encodings}</div>}
-              {parquet.totalCompressedSize != null && (
-                <div>compressed: {formatBytes(parquet.totalCompressedSize)}</div>
-              )}
-              {parquet.totalUncompressedSize != null && (
-                <div>uncompressed: {formatBytes(parquet.totalUncompressedSize)}</div>
-              )}
-              {parquet.totalUncompressedSize != null && parquet.totalCompressedSize != null && (
-                <div>
-                  ratio: {formatRatio(parquet.totalUncompressedSize, parquet.totalCompressedSize)}
-                </div>
-              )}
-              {parquet.hasBloomFilter && <div>bloom filter: yes</div>}
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>type</div>
+              <TypeTree type={type} />
+              <div style={{ height: 6 }} />
             </>
           )}
-          {(parquet.numValues != null ||
-            parquet.statsNullCount != null ||
-            parquet.statsDistinctCount != null ||
-            parquet.statsMin != null ||
-            parquet.statsMax != null) && (
+          {parquet && Object.values(parquet).some((v) => v != null) && (
             <>
-              <div style={{ fontWeight: 600, marginTop: 6, marginBottom: 4 }}>stats</div>
-              {parquet.numValues != null && (
-                <div>values: {numberFmt.format(parquet.numValues)}</div>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>schema</div>
+              {parquet.physical && <div>physical: {parquet.physical}</div>}
+              {parquet.typeLength != null && <div>type_length: {parquet.typeLength}</div>}
+              {parquet.repetition && <div>repetition: {parquet.repetition}</div>}
+              {parquet.convertedType && <div>converted: {parquet.convertedType}</div>}
+              {parquet.logicalType && <div>logical: {parquet.logicalType}</div>}
+              {parquet.precision != null && <div>precision: {parquet.precision}</div>}
+              {parquet.scale != null && <div>scale: {parquet.scale}</div>}
+              {parquet.fieldId != null && <div>field_id: {parquet.fieldId}</div>}
+              {parquet.pathInSchema && parquet.pathInSchema.length > 0 && (
+                <div>path: {parquet.pathInSchema.join(".")}</div>
               )}
-              {parquet.statsNullCount != null && (
-                <div>nulls: {numberFmt.format(parquet.statsNullCount)}</div>
+              {(parquet.compression ||
+                parquet.encodings ||
+                parquet.totalCompressedSize != null) && (
+                <>
+                  <div style={{ fontWeight: 600, marginTop: 6, marginBottom: 4 }}>storage</div>
+                  {parquet.compression && <div>compression: {parquet.compression}</div>}
+                  {parquet.encodings && <div>encodings: {parquet.encodings}</div>}
+                  {parquet.totalCompressedSize != null && (
+                    <div>compressed: {formatBytes(parquet.totalCompressedSize)}</div>
+                  )}
+                  {parquet.totalUncompressedSize != null && (
+                    <div>uncompressed: {formatBytes(parquet.totalUncompressedSize)}</div>
+                  )}
+                  {parquet.totalUncompressedSize != null && parquet.totalCompressedSize != null && (
+                    <div>
+                      ratio:{" "}
+                      {formatRatio(parquet.totalUncompressedSize, parquet.totalCompressedSize)}
+                    </div>
+                  )}
+                  {parquet.hasBloomFilter && <div>bloom filter: yes</div>}
+                </>
               )}
-              {parquet.statsDistinctCount != null && parquet.statsDistinctCount > 0 && (
-                <div>distinct: {numberFmt.format(parquet.statsDistinctCount)}</div>
+              {(parquet.numValues != null ||
+                parquet.statsNullCount != null ||
+                parquet.statsDistinctCount != null ||
+                parquet.statsMin != null ||
+                parquet.statsMax != null) && (
+                <>
+                  <div style={{ fontWeight: 600, marginTop: 6, marginBottom: 4 }}>stats</div>
+                  {parquet.numValues != null && (
+                    <div>values: {numberFmt.format(parquet.numValues)}</div>
+                  )}
+                  {parquet.statsNullCount != null && (
+                    <div>nulls: {numberFmt.format(parquet.statsNullCount)}</div>
+                  )}
+                  {parquet.statsDistinctCount != null && parquet.statsDistinctCount > 0 && (
+                    <div>distinct: {numberFmt.format(parquet.statsDistinctCount)}</div>
+                  )}
+                  {parquet.statsMin != null && <div>min: {parquet.statsMin}</div>}
+                  {parquet.statsMax != null && <div>max: {parquet.statsMax}</div>}
+                </>
               )}
-              {parquet.statsMin != null && <div>min: {parquet.statsMin}</div>}
-              {parquet.statsMax != null && <div>max: {parquet.statsMax}</div>}
             </>
           )}
         </span>
@@ -925,10 +1032,9 @@ function scrollByColumn(container: HTMLDivElement | null, dir: 1 | -1) {
   }
   const targetIdx = leadIdx + dir;
   if (targetIdx < 0 || targetIdx >= ths.length) return;
-  container.scrollTo({
-    left: Math.max(0, ths[targetIdx].offsetLeft),
-    behavior: "smooth",
-  });
+  // Instant scroll matches vim-style snappiness. Smooth scroll's ~300ms
+  // default duration felt sluggish for repeated h/l presses.
+  container.scrollLeft = Math.max(0, ths[targetIdx].offsetLeft);
 }
 
 function DataGrid({
@@ -1013,11 +1119,26 @@ function DataGrid({
   const paddingBottom =
     virtualRows.length > 0 ? totalSize - virtualRows[virtualRows.length - 1].end : 0;
 
-  // Scroll the selected row into view whenever it changes — virtualizer-aware.
+  // Scroll the selected row into view whenever it changes. Imperative math
+  // beats virtualizer.scrollToIndex({ align: "auto" }) which sometimes
+  // doesn't scroll when the row is hidden behind the sticky thead at the top.
   useEffect(() => {
     if (selectedIdx == null) return;
-    rowVirtualizer.scrollToIndex(selectedIdx, { align: "auto" });
-  }, [selectedIdx, rowVirtualizer]);
+    const container = scrollRef.current;
+    if (!container) return;
+    const ROW_H = 28; // matches estimateSize above
+    const headerEl = container.querySelector("thead");
+    const headerH = headerEl?.getBoundingClientRect().height ?? 32;
+    const rowTop = selectedIdx * ROW_H;
+    const rowBottom = rowTop + ROW_H;
+    const viewTop = container.scrollTop + headerH;
+    const viewBottom = container.scrollTop + container.clientHeight;
+    if (rowTop < viewTop) {
+      container.scrollTop = Math.max(0, rowTop - headerH);
+    } else if (rowBottom > viewBottom) {
+      container.scrollTop = rowBottom - container.clientHeight;
+    }
+  }, [selectedIdx]);
 
   // When the grid is hidden via `display: none` on tab switch, the virtualizer
   // measures the scroll container as 0×0 and renders no rows. Watch the
@@ -1850,6 +1971,17 @@ export function InfoView({ source }: { source: Source }) {
   const [info, setInfo] = useState<ParquetFileInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [categories, setCategories] = useState<Map<string, Categories>>(new Map());
+  // Pagination + filter for the Columns table — wide files (e.g. 4k+ cols)
+  // would otherwise render a single 4k-row DOM.
+  const [colPage, setColPage] = useState(0);
+  const [colPageSize, setColPageSize] = useState(20);
+  const [colFilter, setColFilter] = useState("");
+  // Reset page when the source changes so we never end up on a page beyond
+  // the new last page.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: alias is the only meaningful trigger
+  useEffect(() => {
+    setColPage(0);
+  }, [source.alias]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1951,86 +2083,22 @@ export function InfoView({ source }: { source: Source }) {
 
       {/* Columns table */}
       <Section title={`Columns (${numColumns})`}>
-        <div style={{ overflow: "auto", border: "1px solid var(--border)", borderRadius: 6 }}>
-          <table
-            style={{
-              width: "100%",
-              borderCollapse: "collapse",
-              fontSize: 11,
-              fontFamily: "var(--mono)",
-            }}
-          >
-            <thead style={{ background: "var(--bg-alt)" }}>
-              <tr style={{ color: "var(--fg-muted)", textAlign: "left" }}>
-                <Th>name</Th>
-                <Th>type</Th>
-                <Th>note</Th>
-                <Th align="right">values</Th>
-                <Th align="right">nulls</Th>
-                <Th align="right">distinct</Th>
-                <Th>compression</Th>
-                <Th>encodings</Th>
-                <Th align="right">compressed</Th>
-                <Th align="right">uncompressed</Th>
-                <Th align="right">ratio</Th>
-                <Th>min</Th>
-                <Th>max</Th>
-                <Th>bloom</Th>
-              </tr>
-            </thead>
-            <tbody>
-              {cols.map((c, i) => {
-                const p: ParquetMeta = pmeta(c) ?? {};
-                return (
-                  <tr
-                    key={c.name}
-                    style={{
-                      background: i % 2 === 1 ? "var(--row-alt)" : "transparent",
-                      borderTop: "1px solid var(--border)",
-                    }}
-                  >
-                    <Td>
-                      <span style={{ fontWeight: 600 }}>{c.name}</span>
-                    </Td>
-                    <Td>
-                      <TypeChip type={c.type} noTooltip />
-                    </Td>
-                    <Td>
-                      <CategoricalNote categories={categories.get(c.name)} />
-                    </Td>
-                    <Td align="right">
-                      {p.numValues != null ? numberFmt.format(p.numValues) : "—"}
-                    </Td>
-                    <Td align="right">
-                      {p.statsNullCount != null ? numberFmt.format(p.statsNullCount) : "—"}
-                    </Td>
-                    <Td align="right">
-                      {p.statsDistinctCount && p.statsDistinctCount > 0
-                        ? numberFmt.format(p.statsDistinctCount)
-                        : "—"}
-                    </Td>
-                    <Td>{p.compression ?? "—"}</Td>
-                    <Td>
-                      <span title={p.encodings ?? ""}>{shorten(p.encodings, 24)}</span>
-                    </Td>
-                    <Td align="right">{formatBytes(p.totalCompressedSize)}</Td>
-                    <Td align="right">{formatBytes(p.totalUncompressedSize)}</Td>
-                    <Td align="right">
-                      {formatRatio(p.totalUncompressedSize, p.totalCompressedSize)}
-                    </Td>
-                    <Td>
-                      <span title={p.statsMin ?? ""}>{shorten(p.statsMin, 16)}</span>
-                    </Td>
-                    <Td>
-                      <span title={p.statsMax ?? ""}>{shorten(p.statsMax, 16)}</span>
-                    </Td>
-                    <Td>{p.hasBloomFilter ? "yes" : "—"}</Td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+        <ColumnsTable
+          cols={cols}
+          categories={categories}
+          page={colPage}
+          pageSize={colPageSize}
+          filter={colFilter}
+          onPage={setColPage}
+          onPageSize={(s) => {
+            setColPageSize(s);
+            setColPage(0);
+          }}
+          onFilter={(f) => {
+            setColFilter(f);
+            setColPage(0);
+          }}
+        />
       </Section>
 
       {/* Row groups table */}
@@ -2112,22 +2180,26 @@ export function InfoView({ source }: { source: Source }) {
                     <span style={{ color: "var(--fg-muted)", fontSize: 10 }}>binary</span>
                   )}
                 </div>
-                <div
-                  style={{
-                    fontFamily: "var(--mono)",
-                    fontSize: 11,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-all",
-                    maxHeight: 200,
-                    overflow: "auto",
-                    background: "var(--bg)",
-                    padding: 6,
-                    borderRadius: 4,
-                    border: "1px solid var(--border)",
-                  }}
-                >
-                  {p.value || "(empty value)"}
-                </div>
+                {p.key === "ARROW:schema" ? (
+                  <ArrowSchemaView b64={p.value} />
+                ) : (
+                  <div
+                    style={{
+                      fontFamily: "var(--mono)",
+                      fontSize: 11,
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-all",
+                      maxHeight: 200,
+                      overflow: "auto",
+                      background: "var(--bg)",
+                      padding: 6,
+                      borderRadius: 4,
+                      border: "1px solid var(--border)",
+                    }}
+                  >
+                    {p.value || "(empty value)"}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -2135,6 +2207,336 @@ export function InfoView({ source }: { source: Source }) {
       )}
 
       {!info && !error && <div style={{ color: "var(--fg-muted)" }}>loading file metadata…</div>}
+    </div>
+  );
+}
+
+const COL_PAGE_SIZES = [20, 50, 100, 500];
+
+function ColumnsTable({
+  cols,
+  categories,
+  page,
+  pageSize,
+  filter,
+  onPage,
+  onPageSize,
+  onFilter,
+}: {
+  cols: Column[];
+  categories: Map<string, Categories>;
+  page: number;
+  pageSize: number;
+  filter: string;
+  onPage: (p: number) => void;
+  onPageSize: (s: number) => void;
+  onFilter: (f: string) => void;
+}) {
+  const filtered = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return cols;
+    return cols.filter((c) => c.name.toLowerCase().includes(q));
+  }, [cols, filter]);
+  const total = filtered.length;
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(page, pageCount - 1);
+  const start = safePage * pageSize;
+  const end = Math.min(start + pageSize, total);
+  const visible = filtered.slice(start, end);
+
+  return (
+    <>
+      <div
+        style={{
+          display: "flex",
+          gap: 8,
+          alignItems: "center",
+          flexWrap: "wrap",
+          marginBottom: 8,
+          fontSize: 12,
+        }}
+      >
+        <input
+          type="text"
+          value={filter}
+          onChange={(e) => onFilter(e.target.value)}
+          placeholder="filter columns by name…"
+          style={{
+            flex: 1,
+            minWidth: 200,
+            padding: "4px 8px",
+            background: "var(--bg)",
+            border: "1px solid var(--border)",
+            borderRadius: 4,
+            color: "var(--fg)",
+            fontSize: 12,
+          }}
+        />
+        <span style={{ color: "var(--fg-muted)", fontFamily: "var(--mono)" }}>
+          {total === 0
+            ? "0 columns"
+            : `${numberFmt.format(start + 1)}–${numberFmt.format(end)} of ${numberFmt.format(total)}${
+                filter ? ` (filtered from ${numberFmt.format(cols.length)})` : ""
+              }`}
+        </span>
+        <label style={{ color: "var(--fg-muted)", display: "flex", gap: 4, alignItems: "center" }}>
+          page size
+          <select
+            value={pageSize}
+            onChange={(e) => onPageSize(Number(e.target.value))}
+            style={{
+              background: "var(--bg)",
+              border: "1px solid var(--border)",
+              color: "var(--fg)",
+              borderRadius: 4,
+              padding: "2px 4px",
+            }}
+          >
+            {COL_PAGE_SIZES.map((s) => (
+              <option key={s} value={s}>
+                {s}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button
+          type="button"
+          disabled={safePage <= 0}
+          onClick={() => onPage(Math.max(0, safePage - 1))}
+        >
+          ← prev
+        </button>
+        <span style={{ color: "var(--fg-muted)", fontFamily: "var(--mono)" }}>
+          {numberFmt.format(safePage + 1)} / {numberFmt.format(pageCount)}
+        </span>
+        <button
+          type="button"
+          disabled={safePage >= pageCount - 1}
+          onClick={() => onPage(Math.min(pageCount - 1, safePage + 1))}
+        >
+          next →
+        </button>
+      </div>
+      <div style={{ overflow: "auto", border: "1px solid var(--border)", borderRadius: 6 }}>
+        <table
+          style={{
+            width: "100%",
+            borderCollapse: "collapse",
+            fontSize: 11,
+            fontFamily: "var(--mono)",
+          }}
+        >
+          <thead style={{ background: "var(--bg-alt)" }}>
+            <tr style={{ color: "var(--fg-muted)", textAlign: "left" }}>
+              <Th>name</Th>
+              <Th>type</Th>
+              <Th>note</Th>
+              <Th align="right">values</Th>
+              <Th align="right">nulls</Th>
+              <Th align="right">distinct</Th>
+              <Th>compression</Th>
+              <Th>encodings</Th>
+              <Th align="right">compressed</Th>
+              <Th align="right">uncompressed</Th>
+              <Th align="right">ratio</Th>
+              <Th>min</Th>
+              <Th>max</Th>
+              <Th>bloom</Th>
+            </tr>
+          </thead>
+          <tbody>
+            {visible.map((c, i) => {
+              const p: ParquetMeta = (c.meta as ParquetMeta | undefined) ?? {};
+              return (
+                <tr
+                  key={c.name}
+                  style={{
+                    background: i % 2 === 1 ? "var(--row-alt)" : "transparent",
+                    borderTop: "1px solid var(--border)",
+                  }}
+                >
+                  <Td>
+                    <span style={{ fontWeight: 600 }}>{c.name}</span>
+                  </Td>
+                  <Td>
+                    <TypeChip type={c.type} />
+                  </Td>
+                  <Td>
+                    <CategoricalNote categories={categories.get(c.name)} />
+                  </Td>
+                  <Td align="right">{p.numValues != null ? numberFmt.format(p.numValues) : "—"}</Td>
+                  <Td align="right">
+                    {p.statsNullCount != null ? numberFmt.format(p.statsNullCount) : "—"}
+                  </Td>
+                  <Td align="right">
+                    {p.statsDistinctCount && p.statsDistinctCount > 0
+                      ? numberFmt.format(p.statsDistinctCount)
+                      : "—"}
+                  </Td>
+                  <Td>{p.compression ?? "—"}</Td>
+                  <Td>
+                    <span title={p.encodings ?? ""}>{shorten(p.encodings, 24)}</span>
+                  </Td>
+                  <Td align="right">{formatBytes(p.totalCompressedSize)}</Td>
+                  <Td align="right">{formatBytes(p.totalUncompressedSize)}</Td>
+                  <Td align="right">
+                    {formatRatio(p.totalUncompressedSize, p.totalCompressedSize)}
+                  </Td>
+                  <Td>
+                    <span title={p.statsMin ?? ""}>{shorten(p.statsMin, 16)}</span>
+                  </Td>
+                  <Td>
+                    <span title={p.statsMax ?? ""}>{shorten(p.statsMax, 16)}</span>
+                  </Td>
+                  <Td>{p.hasBloomFilter ? "yes" : "—"}</Td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+// Decode the IPC-framed Arrow Schema flatbuffer that PyArrow / polars / pandas
+// stash in parquet's key/value metadata under "ARROW:schema". The base64
+// payload is a single Schema Message; apache-arrow's MessageReader parses it
+// synchronously without needing to await an IPC stream.
+function decodeArrowSchema(b64: string): ArrowSchema | null {
+  if (!b64) return null;
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const reader = new MessageReader(bytes);
+    const msg = reader.readMessage();
+    if (!msg || msg.headerType !== MessageHeader.Schema) return null;
+    return msg.header() as ArrowSchema;
+  } catch {
+    return null;
+  }
+}
+
+function ArrowSchemaView({ b64 }: { b64: string }) {
+  const [showRaw, setShowRaw] = useState(false);
+  const schema = useMemo(() => decodeArrowSchema(b64), [b64]);
+  if (!schema) {
+    return (
+      <div
+        style={{
+          fontFamily: "var(--mono)",
+          fontSize: 11,
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-all",
+          maxHeight: 200,
+          overflow: "auto",
+          background: "var(--bg)",
+          padding: 6,
+          borderRadius: 4,
+          border: "1px solid var(--border)",
+        }}
+      >
+        {b64 || "(empty value)"}
+      </div>
+    );
+  }
+  const fields = schema.fields ?? [];
+  const schemaMeta =
+    schema.metadata && schema.metadata.size > 0 ? [...schema.metadata.entries()] : [];
+  return (
+    <div>
+      <div
+        style={{
+          display: "flex",
+          gap: 8,
+          alignItems: "center",
+          marginBottom: 6,
+          fontSize: 11,
+          color: "var(--fg-muted)",
+        }}
+      >
+        <span>
+          decoded — {fields.length} field{fields.length === 1 ? "" : "s"}
+        </span>
+        <button type="button" onClick={() => setShowRaw((v) => !v)}>
+          {showRaw ? "hide raw" : "show raw"}
+        </button>
+      </div>
+      {showRaw && (
+        <div
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-all",
+            maxHeight: 200,
+            overflow: "auto",
+            background: "var(--bg)",
+            padding: 6,
+            borderRadius: 4,
+            border: "1px solid var(--border)",
+            marginBottom: 8,
+          }}
+        >
+          {b64}
+        </div>
+      )}
+      <div
+        style={{
+          fontFamily: "var(--mono)",
+          fontSize: 11,
+          maxHeight: 360,
+          overflow: "auto",
+          background: "var(--bg)",
+          padding: 6,
+          borderRadius: 4,
+          border: "1px solid var(--border)",
+        }}
+      >
+        {fields.map((f) => {
+          const meta = f.metadata && f.metadata.size > 0 ? [...f.metadata.entries()] : [];
+          return (
+            <div
+              key={f.name}
+              style={{ padding: "2px 0", borderBottom: "1px dotted var(--border)" }}
+            >
+              <div>
+                <span style={{ fontWeight: 600 }}>{f.name}</span>{" "}
+                <span style={{ color: "var(--chip-fg, #4c8bf5)" }}>{String(f.type)}</span>
+                {f.nullable ? (
+                  <span style={{ color: "var(--fg-muted)" }}> · nullable</span>
+                ) : (
+                  <span style={{ color: "var(--fg-muted)" }}> · required</span>
+                )}
+              </div>
+              {meta.length > 0 && (
+                <div style={{ paddingLeft: 12, color: "var(--fg-muted)", fontSize: 10 }}>
+                  {meta.map(([k, v]) => (
+                    <div key={k}>
+                      <span>{k}:</span>{" "}
+                      <span style={{ color: "var(--fg)" }}>{shorten(String(v), 200)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {schemaMeta.length > 0 && (
+          <div style={{ marginTop: 8, paddingTop: 6, borderTop: "1px solid var(--border)" }}>
+            <div style={{ fontWeight: 600, color: "var(--fg-muted)", marginBottom: 4 }}>
+              schema metadata
+            </div>
+            {schemaMeta.map(([k, v]) => (
+              <div key={k} style={{ paddingLeft: 12, fontSize: 10 }}>
+                <span style={{ color: "var(--fg-muted)" }}>{k}:</span>{" "}
+                <span>{shorten(String(v), 200)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -2496,7 +2898,7 @@ export function InsightView({ source }: { source: Source }) {
                       <span style={{ fontWeight: 600 }}>{c.name}</span>
                     </Td>
                     <Td>
-                      <TypeChip type={c.type} noTooltip />
+                      <TypeChip type={c.type} />
                     </Td>
                     {glimpseRows.map((row, j) => {
                       const cell = formatCell(row[c.name], c.type);
@@ -2696,7 +3098,7 @@ function renderFamilyRow(family: string, s: ColumnStat) {
     );
 
   push("name", <span style={{ fontWeight: 600 }}>{s.name}</span>);
-  push("type", <TypeChip type={s.type} noTooltip />);
+  push("type", <TypeChip type={s.type} />);
   push("count", numberFmt.format(s.count), "right");
   push("nulls", numberFmt.format(s.nulls), "right");
   const total = s.count + s.nulls;

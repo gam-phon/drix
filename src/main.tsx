@@ -557,7 +557,7 @@ function App() {
           gridTemplateColumns: (() => {
             const sidebar = state.sidebarCollapsed ? "32px " : "240px ";
             const drawer =
-              state.tab === "info" || state.tab === "optimize"
+              state.tab === "info" || state.tab === "optimize" || state.tab === "insight"
                 ? ""
                 : state.drawerCollapsed
                   ? " 32px"
