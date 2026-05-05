@@ -6,7 +6,6 @@ import {
   EmptyState,
   FileTabsBar,
   InfoView,
-  InsightView,
   OptimizationView,
   RowDrawer,
   Sidebar,
@@ -615,16 +614,8 @@ function App() {
             onTabChange={(tab) => dispatch({ type: "SET_TAB", tab })}
           />
           <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
-            {/* DataTab stays mounted across tab switches so TanStack table,
-                virtualizer, and scroll position survive — re-mounting on every
-                return is what made wide tables feel slow on tab switch. */}
-            {activeSource && (
-              <div
-                style={{
-                  display: state.tab === "data" ? "block" : "none",
-                  height: "100%",
-                }}
-              >
+            {state.tab === "data" &&
+              (activeSource ? (
                 <DataTab
                   state={state}
                   dispatch={dispatch}
@@ -632,11 +623,9 @@ function App() {
                   openFilter={openFilter}
                   setOpenFilter={setOpenFilter}
                 />
-              </div>
-            )}
-            {state.tab === "data" && !activeSource && (
-              <EmptyState loadingStage={state.loadingStage} />
-            )}
+              ) : (
+                <EmptyState loadingStage={state.loadingStage} />
+              ))}
             {state.tab === "sql" && <SqlView state={state} dispatch={dispatch} runSql={runSql} />}
             {state.tab === "info" &&
               (activeSource ? (
@@ -650,17 +639,10 @@ function App() {
               ) : (
                 <EmptyState loadingStage={state.loadingStage} />
               ))}
-            {state.tab === "insight" &&
-              (activeSource ? (
-                <InsightView source={activeSource} />
-              ) : (
-                <EmptyState loadingStage={state.loadingStage} />
-              ))}
           </div>
         </main>
         {state.tab !== "info" &&
           state.tab !== "optimize" &&
-          state.tab !== "insight" &&
           (state.drawerCollapsed ? (
             <CollapseHandle side="right" onExpand={() => dispatch({ type: "TOGGLE_DRAWER" })} />
           ) : (
