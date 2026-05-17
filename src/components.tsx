@@ -11,7 +11,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { runQuery } from "./duckdb";
 import { formatBytes, formatRatio, numberFmt } from "./format";
 import {
   CATEGORY_LIMIT,
@@ -23,6 +22,11 @@ import {
   isFilterableSimple,
   typeChipString,
 } from "./formats/parquet";
+import {
+  type ExportReport,
+  buildOptimizedCopySql,
+  exportOptimizedParquet,
+} from "./formats/parquet/export-optimized";
 import type { ColumnStat, Histogram, TopK } from "./formats/parquet/insight";
 import {
   type InsightEntry,
@@ -30,11 +34,7 @@ import {
   startInsight,
   subscribeInsight,
 } from "./formats/parquet/insight-store";
-import {
-  type Suggestion,
-  type SuggestionCategory,
-  suggestionsToCsv,
-} from "./formats/parquet/optimize";
+import type { Suggestion, SuggestionCategory } from "./formats/parquet/optimize";
 import {
   type OptimizeEntry,
   getOptimizeEntry,
@@ -42,6 +42,7 @@ import {
   startOptimize,
   subscribeOptimize,
 } from "./formats/parquet/optimize-store";
+import { buildPolarsScript } from "./formats/parquet/polars-script";
 import type { ParquetFileInfo, ParquetMeta } from "./formats/parquet/types";
 import type { Action, Column, FilterOp, FilterValue, SortEntry, Source, State } from "./types";
 
@@ -2773,22 +2774,123 @@ function dtypeDistribution(columns: Column[]): { label: string; count: number }[
     .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
 }
 
+type InsightSubTab = "statistics" | "correlations" | "data-quality" | "anomalies";
+
 export function InsightView({ source }: { source: Source }) {
+  const [subTab, setSubTab] = useState<InsightSubTab>("statistics");
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
+      <InsightSubTabsBar active={subTab} onChange={setSubTab} />
+      <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
+        {subTab === "statistics" && <StatisticsView source={source} />}
+        {subTab === "correlations" && (
+          <InsightPlaceholder
+            title="Correlations"
+            desc="Pairwise column relationships will appear here."
+          />
+        )}
+        {subTab === "data-quality" && (
+          <InsightPlaceholder
+            title="Data quality"
+            desc="Null rates, duplicates, and constraint checks will appear here."
+          />
+        )}
+        {subTab === "anomalies" && (
+          <InsightPlaceholder
+            title="Anomalies"
+            desc="Outliers and unusual value distributions will appear here."
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+const INSIGHT_SUB_TABS: { id: InsightSubTab; label: string }[] = [
+  { id: "statistics", label: "Statistics" },
+  { id: "correlations", label: "Correlations" },
+  { id: "data-quality", label: "Data quality" },
+  { id: "anomalies", label: "Anomalies" },
+];
+
+function InsightSubTabsBar({
+  active,
+  onChange,
+}: {
+  active: InsightSubTab;
+  onChange: (t: InsightSubTab) => void;
+}) {
+  return (
+    <div
+      style={{
+        borderBottom: "1px solid var(--border)",
+        background: "var(--bg-alt)",
+        padding: "8px 12px",
+        display: "flex",
+        gap: 0,
+      }}
+    >
+      {INSIGHT_SUB_TABS.map((t, i) => (
+        <button
+          key={t.id}
+          type="button"
+          onClick={() => onChange(t.id)}
+          className={active === t.id ? "primary" : ""}
+          style={{
+            borderRadius:
+              i === 0 ? "6px 0 0 6px" : i === INSIGHT_SUB_TABS.length - 1 ? "0 6px 6px 0" : 0,
+            borderLeft: i === 0 ? undefined : "none",
+          }}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function InsightPlaceholder({ title, desc }: { title: string; desc: string }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 8,
+        padding: 48,
+        textAlign: "center",
+      }}
+    >
+      <div
+        style={{
+          fontSize: 11,
+          fontWeight: 600,
+          textTransform: "uppercase",
+          color: "var(--fg-muted)",
+          letterSpacing: 0.5,
+        }}
+      >
+        {title}
+      </div>
+      <div style={{ fontSize: 13, color: "var(--fg)" }}>{desc}</div>
+      <div style={{ fontSize: 12, color: "var(--fg-muted)" }}>Not yet implemented.</div>
+    </div>
+  );
+}
+
+function StatisticsView({ source }: { source: Source }) {
   const [entry, setEntry] = useState<InsightEntry>(() => getInsightEntry(source.alias));
   const [now, setNow] = useState(() => performance.now());
-  const [glimpseRows, setGlimpseRows] = useState<Record<string, unknown>[] | null>(null);
-  const [glimpseError, setGlimpseError] = useState<string | null>(null);
-  // Shared filter + page size across glimpse and per-family describe tables.
+  // Shared filter + page size across the per-family describe tables.
   // Page index is per-table since each family has its own row count.
   const [insightFilter, setInsightFilter] = useState("");
   const [insightPageSize, setInsightPageSize] = useState(20);
-  const [glimpsePage, setGlimpsePage] = useState(0);
   const [familyPages, setFamilyPages] = useState<Record<string, number>>({});
   const setFamilyPage = useCallback((family: string, page: number) => {
     setFamilyPages((m) => ({ ...m, [family]: page }));
   }, []);
   const resetPages = useCallback(() => {
-    setGlimpsePage(0);
     setFamilyPages({});
   }, []);
 
@@ -2804,25 +2906,6 @@ export function InsightView({ source }: { source: Source }) {
   }, [source.alias, insightFilter]);
 
   useEffect(() => {
-    let cancelled = false;
-    setGlimpseRows(null);
-    setGlimpseError(null);
-    (async () => {
-      try {
-        const sql = `SELECT * FROM ${source.adapter.fromExpr(source.alias)} LIMIT 5`;
-        const { result } = await runQuery(sql);
-        if (cancelled) return;
-        setGlimpseRows(result.toArray() as Record<string, unknown>[]);
-      } catch (e) {
-        if (!cancelled) setGlimpseError((e as Error).message);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [source]);
-
-  useEffect(() => {
     if (entry.status !== "running") return;
     const id = window.setInterval(() => setNow(performance.now()), 500);
     return () => window.clearInterval(id);
@@ -2834,7 +2917,7 @@ export function InsightView({ source }: { source: Source }) {
 
   const stats = entry.stats;
   const running = entry.status === "running";
-  const error = entry.error ?? glimpseError;
+  const error = entry.error;
 
   const grouped = useMemo(() => {
     const m = new Map<string, ColumnStat[]>();
@@ -2866,13 +2949,12 @@ export function InsightView({ source }: { source: Source }) {
         }}
       >
         <div style={{ fontSize: 12, color: "var(--fg-muted)" }}>
-          Statistical overview of column values — like pandas <code>describe()</code> + polars{" "}
-          <code>glimpse()</code>. Schema and a 5-row glimpse render immediately; click below to
-          compute per-column stats and distributions.
+          Statistical overview of column values — like pandas <code>describe()</code>. The schema
+          summary renders immediately; click below to compute per-column stats and distributions.
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <button type="button" className="primary" onClick={onRun} disabled={running}>
-            {running ? "Analyzing…" : stats ? "Re-run analysis" : "Run analysis"}
+            {running ? "Computing…" : stats ? "Re-compute statistics" : "Compute statistics"}
           </button>
           {running && entry.progress && (
             <ProgressLine
@@ -2910,37 +2992,14 @@ export function InsightView({ source }: { source: Source }) {
           {dtypes.length === 0 ? (
             <span style={{ color: "var(--fg-muted)" }}>—</span>
           ) : (
-            dtypes
-              .slice(0, 10)
-              .map((d) => <KvRow key={d.label} k={d.label} v={`× ${numberFmt.format(d.count)}`} />)
-          )}
-          {dtypes.length > 10 && (
-            <KvRow k="…" v={`+${numberFmt.format(dtypes.length - 10)} more`} />
+            <div style={{ maxHeight: 200, overflowY: "auto", paddingRight: 10 }}>
+              {dtypes.map((d) => (
+                <KvRow key={d.label} k={d.label} v={`× ${numberFmt.format(d.count)}`} />
+              ))}
+            </div>
           )}
         </InfoCard>
       </div>
-
-      {/* Glimpse */}
-      <Section title="Glimpse (first 5 rows)">
-        {glimpseRows == null && !glimpseError && (
-          <div style={{ color: "var(--fg-muted)", fontSize: 12 }}>loading…</div>
-        )}
-        {glimpseRows != null && glimpseRows.length === 0 && (
-          <div style={{ color: "var(--fg-muted)", fontSize: 12 }}>no rows</div>
-        )}
-        {glimpseRows != null && glimpseRows.length > 0 && (
-          <GlimpseTable
-            cols={source.columns}
-            rows={glimpseRows}
-            page={glimpsePage}
-            pageSize={insightPageSize}
-            filter={insightFilter}
-            onPage={setGlimpsePage}
-            onPageSize={setInsightPageSize}
-            onFilter={setInsightFilter}
-          />
-        )}
-      </Section>
 
       {/* Describe sections per family */}
       {stats &&
@@ -2963,122 +3022,6 @@ export function InsightView({ source }: { source: Source }) {
           );
         })}
     </div>
-  );
-}
-
-function GlimpseTable({
-  cols,
-  rows,
-  page,
-  pageSize,
-  filter,
-  onPage,
-  onPageSize,
-  onFilter,
-}: {
-  cols: Column[];
-  rows: Record<string, unknown>[];
-  page: number;
-  pageSize: number;
-  filter: string;
-  onPage: (p: number) => void;
-  onPageSize: (s: number) => void;
-  onFilter: (f: string) => void;
-}) {
-  const filtered = useMemo(() => {
-    const q = filter.trim().toLowerCase();
-    if (!q) return cols;
-    return cols.filter((c) => c.name.toLowerCase().includes(q));
-  }, [cols, filter]);
-  const total = filtered.length;
-  const pageCount = Math.max(1, Math.ceil(total / pageSize));
-  const safePage = Math.min(page, pageCount - 1);
-  const start = safePage * pageSize;
-  const end = Math.min(start + pageSize, total);
-  const visible = filtered.slice(start, end);
-  return (
-    <>
-      <TablePager
-        total={total}
-        rawTotal={cols.length}
-        page={safePage}
-        pageSize={pageSize}
-        filter={filter}
-        onPage={onPage}
-        onPageSize={onPageSize}
-        onFilter={onFilter}
-        placeholder="filter columns by name…"
-        unit="columns"
-      />
-      <div style={{ overflow: "auto", border: "1px solid var(--border)", borderRadius: 6 }}>
-        <table
-          style={{
-            width: "100%",
-            borderCollapse: "collapse",
-            fontSize: 11,
-            fontFamily: "var(--mono)",
-          }}
-        >
-          <thead style={{ background: "var(--bg-alt)" }}>
-            <tr style={{ color: "var(--fg-muted)", textAlign: "left" }}>
-              <Th>column</Th>
-              <Th>type</Th>
-              {rows.map((_, i) => (
-                // biome-ignore lint/suspicious/noArrayIndexKey: glimpse rows are a frozen 5-row sample
-                <Th key={i}>row {i + 1}</Th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {visible.map((c, i) => (
-              <tr
-                key={c.name}
-                style={{
-                  background: i % 2 === 1 ? "var(--row-alt)" : "transparent",
-                  borderTop: "1px solid var(--border)",
-                }}
-              >
-                <Td>
-                  <span style={{ fontWeight: 600 }}>{c.name}</span>
-                </Td>
-                <Td>
-                  <TypeChip type={c.type} />
-                </Td>
-                {rows.map((row, j) => {
-                  const cell = formatCell(row[c.name], c.type);
-                  const text =
-                    cell.display === "tree"
-                      ? cell.preview
-                      : cell.display === "blob"
-                        ? `<${cell.bytes.byteLength} bytes>`
-                        : cell.text;
-                  const muted = cell.display === "muted";
-                  return (
-                    // biome-ignore lint/suspicious/noArrayIndexKey: glimpse rows are a frozen 5-row sample
-                    <Td key={j}>
-                      <span
-                        title={text}
-                        style={{
-                          color: muted ? "var(--fg-muted)" : undefined,
-                          display: "inline-block",
-                          maxWidth: 180,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                          verticalAlign: "bottom",
-                        }}
-                      >
-                        {shorten(text, 32)}
-                      </span>
-                    </Td>
-                  );
-                })}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </>
   );
 }
 
@@ -3369,6 +3312,12 @@ export function OptimizationView({ source }: { source: Source }) {
   // `now` is a re-render heartbeat used to recompute elapsed/ETA every second
   // while analysis is running.
   const [now, setNow] = useState(() => performance.now());
+  // Checked suggestion ids, the code-generator engine, and the last export.
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [engine, setEngine] = useState<"polars" | "duckdb">("polars");
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [exportReport, setExportReport] = useState<ExportReport | null>(null);
 
   useEffect(() => {
     setEntry(getOptimizeEntry(source.alias));
@@ -3401,13 +3350,69 @@ export function OptimizationView({ source }: { source: Source }) {
     return () => window.clearInterval(id);
   }, [entry.status]);
 
+  const suggestions = entry.suggestions;
+  const running = entry.status === "running";
+  const error = entry.error ?? infoError;
+
+  // A fresh analysis: check every actionable suggestion and drop the old
+  // export report.
+  useEffect(() => {
+    if (!suggestions) {
+      setSelected(new Set());
+      setExportReport(null);
+      return;
+    }
+    setSelected(new Set(suggestions.filter((s) => s.polars).map((s) => s.id)));
+    setExportReport(null);
+    setExportError(null);
+  }, [suggestions]);
+
   const onRun = useCallback(() => {
     void startOptimize(source.adapter, source.alias, source.columns, source.fileSizeBytes, info);
   }, [info, source]);
 
-  const suggestions = entry.suggestions;
-  const running = entry.status === "running";
-  const error = entry.error ?? infoError;
+  const toggle = useCallback((id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const setMany = useCallback((ids: string[], on: boolean) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const id of ids) {
+        if (on) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
+  }, []);
+
+  const onExport = useCallback(async () => {
+    if (!suggestions) return;
+    setExporting(true);
+    setExportError(null);
+    try {
+      const report = await exportOptimizedParquet({
+        adapter: source.adapter,
+        alias: source.alias,
+        displayName: source.displayName,
+        fileSizeBytes: source.fileSizeBytes,
+        info,
+        columns: source.columns,
+        suggestions,
+        selected,
+      });
+      setExportReport(report);
+    } catch (e) {
+      setExportError((e as Error).message);
+    } finally {
+      setExporting(false);
+    }
+  }, [suggestions, selected, source, info]);
 
   const grouped = useMemo(() => {
     const m = new Map<SuggestionCategory, Suggestion[]>();
@@ -3435,6 +3440,22 @@ export function OptimizationView({ source }: { source: Source }) {
     return { total: suggestions.length, high, medium, low, savings };
   }, [suggestions]);
 
+  // The generated code for the chosen engine — recomputed as checkboxes change.
+  const script = useMemo(() => {
+    if (!suggestions || suggestions.length === 0) return "";
+    const output = `${source.displayName.replace(/\.parquet$/i, "")}.optimized.parquet`;
+    if (engine === "polars") {
+      return buildPolarsScript(suggestions, selected, { input: source.displayName, output });
+    }
+    const sql = buildOptimizedCopySql(source.columns, suggestions, selected, {
+      from: `'${source.displayName.replace(/'/g, "''")}'`,
+      output,
+    });
+    return `duckdb.sql("""\n${sql}\n""")`;
+  }, [suggestions, selected, engine, source]);
+
+  const hasSuggestions = suggestions != null && suggestions.length > 0;
+
   return (
     <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 20, maxWidth: 1100 }}>
       <div
@@ -3449,20 +3470,25 @@ export function OptimizationView({ source }: { source: Source }) {
         }}
       >
         <div style={{ fontSize: 12, color: "var(--fg-muted)" }}>
-          Deep-scans every column to suggest tighter types, better compression codecs and encodings,
-          bloom filters, and row-group sort keys. Read-only — no file is modified.
+          Deep-scans every column (and struct leaf field) to suggest tighter types, better
+          compression codecs and encodings, bloom filters, and row-group sort keys. Tick the
+          suggestions to apply, copy the generated Polars / DuckDB code, or export the optimized
+          file directly. Strings stored as numbers, booleans or <strong>ISO-8601</strong>{" "}
+          dates/timestamps are detected and retyped — non-ISO date formats (e.g.{" "}
+          <code>MM/DD/YYYY</code>, <code>Jan 5 2020</code>) are not detected yet.
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <button type="button" className="primary" onClick={onRun} disabled={running}>
             {running ? "Analyzing…" : suggestions ? "Re-run analysis" : "Run analysis"}
           </button>
-          {suggestions && suggestions.length > 0 && (
+          {hasSuggestions && (
             <button
               type="button"
-              onClick={() => exportSuggestionsCsv(source.displayName, suggestions)}
-              title="Download the suggestions list as CSV"
+              onClick={() => void onExport()}
+              disabled={exporting || running}
+              title="Apply the checked rules with DuckDB and download the optimized .parquet"
             >
-              Export CSV
+              {exporting ? "Exporting…" : "Export optimized .parquet"}
             </button>
           )}
           {!info && !error && !running && (
@@ -3488,6 +3514,9 @@ export function OptimizationView({ source }: { source: Source }) {
       </div>
 
       {error && <div style={{ color: "var(--danger)" }}>{error}</div>}
+      {exportError && <div style={{ color: "var(--danger)" }}>Export failed: {exportError}</div>}
+
+      {exportReport && <ExportReportCard report={exportReport} />}
 
       {totals && (
         <div
@@ -3531,10 +3560,79 @@ export function OptimizationView({ source }: { source: Source }) {
         </div>
       )}
 
+      {hasSuggestions && (
+        <Section title="Optimization code">
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ display: "flex", gap: 0, alignItems: "center" }}>
+              <button
+                type="button"
+                onClick={() => setEngine("polars")}
+                className={engine === "polars" ? "primary" : ""}
+                style={{ borderRadius: "6px 0 0 6px" }}
+              >
+                Polars
+              </button>
+              <button
+                type="button"
+                onClick={() => setEngine("duckdb")}
+                className={engine === "duckdb" ? "primary" : ""}
+                style={{ borderRadius: "0 6px 6px 0", borderLeft: "none" }}
+              >
+                DuckDB
+              </button>
+              <span style={{ marginLeft: 10, fontSize: 11, color: "var(--fg-muted)" }}>
+                {engine === "polars"
+                  ? "Polars (Python) — runs in your own pipeline"
+                  : "DuckDB SQL (Python) — exactly what Export runs"}
+              </span>
+            </div>
+            <div
+              style={{
+                position: "relative",
+                border: "1px solid var(--border)",
+                borderRadius: 6,
+                background: "var(--bg-alt)",
+              }}
+            >
+              <div style={{ position: "absolute", top: 6, right: 6 }}>
+                <CopyButton text={script} />
+              </div>
+              <pre
+                style={{
+                  margin: 0,
+                  padding: 12,
+                  overflow: "auto",
+                  maxHeight: 380,
+                  fontSize: 11,
+                  fontFamily: "var(--mono)",
+                  whiteSpace: "pre",
+                }}
+              >
+                {script}
+              </pre>
+            </div>
+            <div style={{ fontSize: 11, color: "var(--fg-muted)", lineHeight: 1.5 }}>
+              The in-browser <strong>Export</strong> uses DuckDB's writer — it applies casts, sort,
+              ZSTD, row-group size and bloom filters, but DuckDB chooses per-column encodings
+              (dictionary / RLE / DELTA) itself. Running the generated <strong>Polars</strong>{" "}
+              script instead pins encodings precisely via PyArrow (<code>column_encoding</code>,{" "}
+              <code>pl.Enum</code>), so a Polars rewrite can leave fewer leftover suggestions on a
+              re-scan. One known case: a <strong>timezone-aware timestamp</strong> cannot be
+              downgraded below microseconds by the DuckDB export — DuckDB has no tz-aware
+              millisecond type (<code>TIMESTAMPTZ</code> is µs-only), so that suggestion reappears
+              after a DuckDB export and only clears via the Polars script (
+              <code>pl.Datetime("ms", "UTC")</code>).
+            </div>
+          </div>
+        </Section>
+      )}
+
       {suggestions &&
         SUGGESTION_GROUP_ORDER.map((cat) => {
           const items = grouped.get(cat);
           if (!items || items.length === 0) return null;
+          const actionable = items.filter((s) => s.polars);
+          const allOn = actionable.length > 0 && actionable.every((s) => selected.has(s.id));
           return (
             <Section key={cat} title={`${SUGGESTION_GROUP_TITLES[cat]} (${items.length})`}>
               <div style={{ overflow: "auto", border: "1px solid var(--border)", borderRadius: 6 }}>
@@ -3548,6 +3646,21 @@ export function OptimizationView({ source }: { source: Source }) {
                 >
                   <thead style={{ background: "var(--bg-alt)" }}>
                     <tr style={{ color: "var(--fg-muted)", textAlign: "left" }}>
+                      <Th>
+                        {actionable.length > 0 && (
+                          <input
+                            type="checkbox"
+                            checked={allOn}
+                            title={allOn ? "Uncheck all" : "Check all"}
+                            onChange={() =>
+                              setMany(
+                                actionable.map((s) => s.id),
+                                !allOn,
+                              )
+                            }
+                          />
+                        )}
+                      </Th>
                       <Th>severity</Th>
                       <Th>column</Th>
                       <Th>suggestion</Th>
@@ -3566,6 +3679,15 @@ export function OptimizationView({ source }: { source: Source }) {
                           borderTop: "1px solid var(--border)",
                         }}
                       >
+                        <Td>
+                          {s.polars && (
+                            <input
+                              type="checkbox"
+                              checked={selected.has(s.id)}
+                              onChange={() => toggle(s.id)}
+                            />
+                          )}
+                        </Td>
                         <Td>
                           <SeverityChip severity={s.severity} />
                         </Td>
@@ -3601,6 +3723,106 @@ export function OptimizationView({ source }: { source: Source }) {
   );
 }
 
+// Summary shown after "Export optimized .parquet" — measured size delta,
+// row-group layout change, and the read-speed wins from the applied rules.
+function ExportReportCard({ report }: { report: ExportReport }) {
+  const grew = report.savedBytes < 0;
+  // Green when the file shrank (the win); red if it grew.
+  const accent = grew ? "var(--danger)" : "var(--success)";
+  const deltaText = grew
+    ? `grew by ${formatBytes(-report.savedBytes)} (+${Math.abs(report.savedPct).toFixed(1)}%)`
+    : `saved ${formatBytes(report.savedBytes)} (${report.savedPct.toFixed(1)}%)`;
+  const row = (k: string, v: React.ReactNode) => (
+    <div
+      style={{
+        display: "flex",
+        justifyContent: "space-between",
+        gap: 8,
+        padding: "2px 0",
+        fontSize: 12,
+      }}
+    >
+      <span style={{ color: "var(--fg-muted)" }}>{k}</span>
+      <span style={{ fontFamily: "var(--mono)", textAlign: "right" }}>{v}</span>
+    </div>
+  );
+  return (
+    <div
+      style={{
+        border: "1px solid var(--border)",
+        borderLeft: `3px solid ${accent}`,
+        borderRadius: 6,
+        padding: 12,
+        background: grew ? "var(--bg-alt)" : "var(--success-bg)",
+        display: "flex",
+        flexDirection: "column",
+        gap: 6,
+      }}
+    >
+      <div
+        style={{
+          fontSize: 11,
+          fontWeight: 600,
+          textTransform: "uppercase",
+          color: accent,
+          letterSpacing: 0.5,
+        }}
+      >
+        {grew ? "Optimized file exported" : "✓ Optimized file exported"}
+      </div>
+      {row(
+        "size",
+        <>
+          <span style={{ color: "var(--fg-muted)" }}>{formatBytes(report.originalBytes)}</span>
+          <span style={{ color: "var(--fg-muted)" }}> → </span>
+          <span style={{ color: accent, fontWeight: 600 }}>
+            {formatBytes(report.optimizedBytes)}
+          </span>
+        </>,
+      )}
+      {row(
+        grew ? "change" : "saved",
+        <span style={{ color: accent, fontWeight: 600 }}>{deltaText}</span>,
+      )}
+      {report.originalRowGroups > 0 &&
+        report.optimizedRowGroups > 0 &&
+        row(
+          "row groups",
+          `${report.originalRowGroups.toLocaleString()} → ${report.optimizedRowGroups.toLocaleString()}`,
+        )}
+      {report.fasterReads.length > 0 && (
+        <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 3 }}>
+          <div style={{ fontSize: 11, color: "var(--fg-muted)" }}>Faster reads</div>
+          {report.fasterReads.map((t) => (
+            <div key={t} style={{ display: "flex", gap: 6, fontSize: 12, alignItems: "baseline" }}>
+              <span style={{ color: "var(--success)", fontWeight: 700 }}>✓</span>
+              <span>{t}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Copy-to-clipboard button with a transient "Copied!" label.
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        void navigator.clipboard.writeText(text).then(() => {
+          setCopied(true);
+          window.setTimeout(() => setCopied(false), 1500);
+        });
+      }}
+    >
+      {copied ? "Copied!" : "Copy"}
+    </button>
+  );
+}
+
 function ProgressLine({
   startedAt,
   now,
@@ -3612,7 +3834,7 @@ function ProgressLine({
   now: number;
   done: number;
   total: number;
-  phase: "columns" | "rowgroups" | "charts" | "done";
+  phase: "columns" | "measuring" | "rowgroups" | "charts" | "done";
 }) {
   const elapsedMs = startedAt != null ? Math.max(0, now - startedAt) : 0;
   const fraction = total > 0 ? done / total : 0;
@@ -3620,7 +3842,13 @@ function ProgressLine({
   // divide by zero and show a wildly wrong estimate on file open.
   const etaMs = done > 0 && fraction < 1 ? (elapsedMs / fraction) * (1 - fraction) : null;
   const phaseLabel =
-    phase === "rowgroups" ? "row groups" : phase === "charts" ? "distributions" : "columns";
+    phase === "rowgroups"
+      ? "row groups"
+      : phase === "measuring"
+        ? "compression sample"
+        : phase === "charts"
+          ? "distributions"
+          : "columns";
   return (
     <div
       style={{
@@ -3667,17 +3895,6 @@ function ProgressLine({
       </div>
     </div>
   );
-}
-
-function exportSuggestionsCsv(displayName: string, suggestions: Suggestion[]) {
-  const csv = suggestionsToCsv(suggestions);
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `${displayName.replace(/\.parquet$/i, "")}.optimization.csv`;
-  a.click();
-  URL.revokeObjectURL(url);
 }
 
 function formatDuration(ms: number): string {

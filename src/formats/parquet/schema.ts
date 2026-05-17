@@ -2,7 +2,41 @@ import { runQuery } from "../../duckdb";
 import { quoteLiteral } from "../../query";
 import type { Column } from "../../types";
 import { parseParquetType } from "./parser";
-import type { ParquetMeta } from "./types";
+import type { ParquetMeta, ParquetType } from "./types";
+
+// DESCRIBE collapses parquet TIMESTAMP(MILLIS) and TIMESTAMP(MICROS) onto
+// DuckDB's microsecond TIMESTAMP, losing the true stored unit — which makes
+// the optimizer keep suggesting a MICROS→MILLIS downgrade on a column that is
+// already MILLIS. Recover the real unit from the parquet metadata.
+//
+// `converted_type` is the reliable signal: a single enum string
+// (`TIMESTAMP_MILLIS` / `TIMESTAMP_MICROS`), present on timestamps from every
+// common writer. `logical_type` is only a best-effort fallback — its shape
+// varies across DuckDB versions, so we coerce it to a string defensively.
+function refineTimestampUnit(type: ParquetType, meta: ParquetMeta | undefined): ParquetType {
+  if (type.kind !== "TIMESTAMP" || !meta) return type;
+  let unit: "MILLIS" | "MICROS" | "NANOS" | null = null;
+  const ct = typeof meta.convertedType === "string" ? meta.convertedType.toUpperCase() : "";
+  if (ct.includes("MILLIS")) unit = "MILLIS";
+  else if (ct.includes("MICROS")) unit = "MICROS";
+  else if (ct.includes("NANOS")) unit = "NANOS";
+  else {
+    // Logical-type-only file (no legacy converted_type): scan whatever the
+    // logical type stringifies to. DuckDB renders the set unit as
+    // `MilliSeconds()` / `MicroSeconds()` / `NanoSeconds()` and the others as
+    // `<null>`, so match the spelled-out form to pick the one that is set.
+    const lt =
+      typeof meta.logicalType === "string"
+        ? meta.logicalType
+        : meta.logicalType != null
+          ? JSON.stringify(meta.logicalType)
+          : "";
+    if (/NANOS\s*=\s*Nano/i.test(lt)) unit = "NANOS";
+    else if (/MICROS\s*=\s*Micro/i.test(lt)) unit = "MICROS";
+    else if (/MILLIS\s*=\s*Milli/i.test(lt)) unit = "MILLIS";
+  }
+  return unit && unit !== type.unit ? { ...type, unit } : type;
+}
 
 function asNumber(v: unknown): number | undefined {
   if (v == null) return undefined;
@@ -24,22 +58,20 @@ export async function fetchParquetSchema(alias: string): Promise<Column[]> {
 
   const byName: Record<string, ParquetMeta> = {};
 
-  // Schema-level metadata (parquet_schema)
+  // Schema-level metadata (parquet_schema). NOTE: parquet_schema has no
+  // `path_in_schema` column (that lives on parquet_metadata) — selecting it
+  // throws and silently wipes all of this metadata, so key by `name`. For a
+  // top-level column the schema node's name is the column name.
   try {
     const { result: pq } = await runQuery(
-      `SELECT name, type, type_length, repetition_type, num_children, converted_type, logical_type, precision, scale, field_id, path_in_schema FROM parquet_schema(${quoteLiteral(
+      `SELECT name, type, type_length, repetition_type, num_children, converted_type, logical_type, precision, scale, field_id FROM parquet_schema(${quoteLiteral(
         alias,
       )})`,
     );
     const pqRows = pq.toArray() as Array<Record<string, any>>;
     for (const r of pqRows) {
       if (r.num_children != null && Number(r.num_children) > 0 && r.type == null) continue;
-      const path: string[] | undefined = r.path_in_schema
-        ? Array.isArray(r.path_in_schema)
-          ? r.path_in_schema
-          : String(r.path_in_schema).split(".")
-        : undefined;
-      const top = path?.[0] ?? r.name;
+      const top = String(r.name ?? "");
       if (!top) continue;
       if (byName[top]) continue;
       byName[top] = {
@@ -51,7 +83,6 @@ export async function fetchParquetSchema(alias: string): Promise<Column[]> {
         precision: r.precision != null ? Number(r.precision) : undefined,
         scale: r.scale != null ? Number(r.scale) : undefined,
         fieldId: r.field_id != null ? Number(r.field_id) : undefined,
-        pathInSchema: path,
       };
     }
   } catch {
@@ -100,6 +131,9 @@ export async function fetchParquetSchema(alias: string): Promise<Column[]> {
     // tooltip-only; ignore
   }
 
-  for (const c of columns) c.meta = byName[c.name];
+  for (const c of columns) {
+    c.meta = byName[c.name];
+    c.type = refineTimestampUnit(c.type, byName[c.name]);
+  }
   return columns;
 }
