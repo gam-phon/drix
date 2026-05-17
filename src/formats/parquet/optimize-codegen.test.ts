@@ -107,6 +107,18 @@ describe("buildPolarsScript", () => {
     const out = buildPolarsScript(sugs, allOf(sugs), io);
     expect(out).toContain('pl.col("ts").cast(pl.Datetime("us", "UTC"))');
   });
+
+  it("renders a tz-aware millisecond Datetime cast Polars can honor", () => {
+    const sugs = [
+      sug("type:ts", "type", {
+        kind: "cast",
+        path: ["ts"],
+        dtype: { name: "Datetime", unit: "ms", tz: "UTC" },
+      }),
+    ];
+    const out = buildPolarsScript(sugs, allOf(sugs), io);
+    expect(out).toContain('pl.col("ts").cast(pl.Datetime("ms", "UTC"))');
+  });
 });
 
 describe("buildOptimizedCopySql", () => {
@@ -150,6 +162,44 @@ describe("buildOptimizedCopySql", () => {
       output: "out.parquet",
     });
     expect(out).toContain("WRITE_BLOOM_FILTER true");
+  });
+
+  it("drops the no-op tz-aware ms cast on a micros source and notes the µs cap", () => {
+    const tzCols: Column[] = [
+      { name: "ts_tz", type: { kind: "TIMESTAMP", unit: "MICROS", adjustedToUTC: true } },
+    ];
+    const sugs = [
+      sug("type:ts_tz", "type", {
+        kind: "cast",
+        path: ["ts_tz"],
+        dtype: { name: "Datetime", unit: "ms", tz: "UTC" },
+      }),
+    ];
+    const out = buildOptimizedCopySql(tzCols, sugs, allOf(sugs), {
+      from: "'data.parquet'",
+      output: "out.parquet",
+    });
+    expect(out).not.toContain('CAST("ts_tz" AS TIMESTAMPTZ)');
+    expect(out).toContain('-- note: "ts_tz" stays at microsecond precision');
+  });
+
+  it("keeps the tz-aware cast for a NANOS source but still notes the µs cap", () => {
+    const tzCols: Column[] = [
+      { name: "ts_tz", type: { kind: "TIMESTAMP", unit: "NANOS", adjustedToUTC: true } },
+    ];
+    const sugs = [
+      sug("type:ts_tz", "type", {
+        kind: "cast",
+        path: ["ts_tz"],
+        dtype: { name: "Datetime", unit: "ms", tz: "UTC" },
+      }),
+    ];
+    const out = buildOptimizedCopySql(tzCols, sugs, allOf(sugs), {
+      from: "'data.parquet'",
+      output: "out.parquet",
+    });
+    expect(out).toContain("TIMESTAMPTZ");
+    expect(out).toContain('-- note: "ts_tz" stays at microsecond precision');
   });
 });
 

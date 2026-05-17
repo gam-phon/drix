@@ -108,15 +108,32 @@ export function buildOptimizedCopySql(
   let rowGroupRows: number | null = null;
   let wantBloom = false;
   let autoEncoding = false;
+  // Columns whose selected cast asks for tz-aware MILLISECOND precision —
+  // DuckDB's TIMESTAMPTZ is microsecond-only, so the export can't honor it.
+  const tzMillisCapped: string[] = [];
 
   for (const s of suggestions) {
     if (!s.polars || !selected.has(s.id)) continue;
     const r = s.polars;
     switch (r.kind) {
-      case "cast":
+      case "cast": {
+        const tzMillis =
+          r.dtype.name === "Datetime" && !!r.dtype.tz && r.dtype.unit === "ms";
         if (r.path.length === 1) {
-          topCasts.set(r.path[0], r.dtype);
+          if (tzMillis) {
+            // DuckDB writes tz-aware timestamps as microsecond TIMESTAMPTZ and
+            // has no tz-aware MILLIS type. Drop the cast when it would be a pure
+            // no-op (source already micros-tz); keep it for NANOS / INT96
+            // sources, which still gain NANOS→micros.
+            tzMillisCapped.push(r.path[0]);
+            const srcType = colByName.get(r.path[0])?.type;
+            const noop = srcType?.kind === "TIMESTAMP" && srcType.unit === "MICROS";
+            if (!noop) topCasts.set(r.path[0], r.dtype);
+          } else {
+            topCasts.set(r.path[0], r.dtype);
+          }
         } else {
+          if (tzMillis) tzMillisCapped.push(r.path.join("."));
           let root = structRoots.get(r.path[0]);
           if (!root) {
             root = emptyNode();
@@ -135,6 +152,7 @@ export function buildOptimizedCopySql(
           cursor.casts.set(r.path[r.path.length - 1], r.dtype);
         }
         break;
+      }
       case "sort":
         sortRules.push({ column: r.column, rank: r.rank });
         break;
@@ -192,9 +210,19 @@ export function buildOptimizedCopySql(
   const orderBy =
     sortCols.length > 0 ? `\n    ORDER BY ${sortCols.map((c) => quoteIdent(c)).join(", ")}` : "";
 
-  const note = autoEncoding
-    ? "\n    -- dictionary / RLE / DELTA encoding is chosen automatically by DuckDB"
-    : "";
+  const notes: string[] = [];
+  if (autoEncoding) {
+    notes.push("-- dictionary / RLE / DELTA encoding is chosen automatically by DuckDB");
+  }
+  if (tzMillisCapped.length > 0) {
+    const cols = tzMillisCapped.map((c) => `"${c}"`).join(", ");
+    notes.push(
+      `-- note: ${cols} stays at microsecond precision — DuckDB writes timezone-aware`,
+      "--       timestamps as TIMESTAMPTZ (µs-only). Run the Polars script for true",
+      "--       millisecond precision.",
+    );
+  }
+  const note = notes.length > 0 ? `\n    ${notes.join("\n    ")}` : "";
 
   // PARQUET_VERSION V2 — without it DuckDB's COPY writes the legacy 1.0 format,
   // leaving the "Upgrade format version" suggestion unresolved after export.
