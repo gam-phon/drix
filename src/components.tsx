@@ -44,6 +44,9 @@ import {
 } from "./formats/parquet/optimize-store";
 import { buildPolarsScript } from "./formats/parquet/polars-script";
 import type { ParquetFileInfo, ParquetMeta } from "./formats/parquet/types";
+import { AnomaliesView } from "./insight/anomalies";
+import { CorrelationsView } from "./insight/correlations";
+import { DataQualityView } from "./insight/data-quality";
 import type { Action, Column, FilterOp, FilterValue, SortEntry, Source, State } from "./types";
 
 // Treat Column.meta as parquet metadata. The viewer is parquet-only today;
@@ -2783,24 +2786,9 @@ export function InsightView({ source }: { source: Source }) {
       <InsightSubTabsBar active={subTab} onChange={setSubTab} />
       <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
         {subTab === "statistics" && <StatisticsView source={source} />}
-        {subTab === "correlations" && (
-          <InsightPlaceholder
-            title="Correlations"
-            desc="Pairwise column relationships will appear here."
-          />
-        )}
-        {subTab === "data-quality" && (
-          <InsightPlaceholder
-            title="Data quality"
-            desc="Null rates, duplicates, and constraint checks will appear here."
-          />
-        )}
-        {subTab === "anomalies" && (
-          <InsightPlaceholder
-            title="Anomalies"
-            desc="Outliers and unusual value distributions will appear here."
-          />
-        )}
+        {subTab === "correlations" && <CorrelationsView source={source} />}
+        {subTab === "data-quality" && <DataQualityView source={source} />}
+        {subTab === "anomalies" && <AnomaliesView source={source} />}
       </div>
     </div>
   );
@@ -2845,36 +2833,6 @@ function InsightSubTabsBar({
           {t.label}
         </button>
       ))}
-    </div>
-  );
-}
-
-function InsightPlaceholder({ title, desc }: { title: string; desc: string }) {
-  return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        justifyContent: "center",
-        gap: 8,
-        padding: 48,
-        textAlign: "center",
-      }}
-    >
-      <div
-        style={{
-          fontSize: 11,
-          fontWeight: 600,
-          textTransform: "uppercase",
-          color: "var(--fg-muted)",
-          letterSpacing: 0.5,
-        }}
-      >
-        {title}
-      </div>
-      <div style={{ fontSize: 13, color: "var(--fg)" }}>{desc}</div>
-      <div style={{ fontSize: 12, color: "var(--fg-muted)" }}>Not yet implemented.</div>
     </div>
   );
 }
