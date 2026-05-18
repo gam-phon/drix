@@ -82,13 +82,13 @@ npm install
 npm run dev          # http://localhost:5173
 ```
 
-Need a parquet to play with? If you have the `duckdb` CLI installed:
+Need a parquet to play with?
 
 ```bash
-npm run sample       # writes ./sample.parquet covering every supported parquet type
+npm run sample       # writes public/sample.parquet covering every supported parquet type
 ```
 
-Then drop `sample.parquet` onto the page.
+Then drop `sample.parquet` onto the page, or open `/parquet?demo` to load it automatically.
 
 ## Scripts
 
@@ -101,7 +101,8 @@ Then drop `sample.parquet` onto the page.
 | `npm run format` | Biome format-write |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm test` | Vitest — unit tests covering the parser, query builder, formatters |
-| `npm run sample` | Generate a sample parquet via the local `duckdb` CLI |
+| `npm run sample` | Generate `public/sample.parquet` (via `@duckdb/node-api`) |
+| `npm run screenshots` | Capture viewer screenshots for the landing page (needs a running server) |
 
 ## How it works (90 seconds)
 

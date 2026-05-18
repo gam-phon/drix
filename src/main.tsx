@@ -215,6 +215,12 @@ function useDebounced<T>(value: T, ms: number): T {
   return v;
 }
 
+// Sample query used by `?demo&tab=sql` to showcase the SQL console.
+const DEMO_SQL = `SELECT col AS color, count(*) AS rows, round(avg(f64), 2) AS avg_f64
+FROM read_parquet('sample.parquet')
+GROUP BY col
+ORDER BY rows DESC;`;
+
 // =========================================================================
 // App
 // =========================================================================
@@ -383,8 +389,10 @@ function App() {
     };
   }, [activeSource, debouncedFilters, debouncedGlobalFilter]);
 
-  const runSql = useCallback(async () => {
-    const text = state.sqlText.trim();
+  // Core SQL executor — takes the query text directly so it can be driven
+  // both by the SQL tab and by the `?demo` auto-loader.
+  const executeSql = useCallback(async (rawText: string) => {
+    const text = rawText.trim();
     if (!text) return;
     try {
       const { result, ms } = await runQuery(text);
@@ -420,7 +428,41 @@ function App() {
         error: (e as Error).message,
       });
     }
-  }, [state.sqlText]);
+  }, []);
+
+  const runSql = useCallback(() => executeSql(state.sqlText), [executeSql, state.sqlText]);
+
+  // `?demo` mode: auto-load the bundled sample file so first-time visitors (and
+  // the screenshot capture script) see a populated viewer. `&tab=` opens a
+  // specific feature tab; `tab=sql` also runs a sample query.
+  const demoRanRef = useRef(false);
+  useEffect(() => {
+    if (demoRanRef.current) return;
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has("demo")) return;
+    demoRanRef.current = true;
+    const tabParam = params.get("tab");
+    (async () => {
+      try {
+        const res = await fetch("/sample.parquet");
+        if (!res.ok) throw new Error(`Could not load sample.parquet (${res.status})`);
+        const blob = await res.blob();
+        await loadFile(new File([blob], "sample.parquet"));
+      } catch (e) {
+        dispatch({ type: "SET_ERROR", error: (e as Error).message });
+        return;
+      }
+      const tabs = ["data", "sql", "info", "optimize", "insight"] as const;
+      const tab = tabs.find((t) => t === tabParam);
+      if (tab) {
+        dispatch({ type: "SET_TAB", tab });
+        if (tab === "sql") {
+          dispatch({ type: "SET_SQL_TEXT", text: DEMO_SQL });
+          void executeSql(DEMO_SQL);
+        }
+      }
+    })();
+  }, [loadFile, executeSql]);
 
   const exportCsv = useCallback(async () => {
     if (!activeSource) return;

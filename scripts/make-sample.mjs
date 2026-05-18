@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-// Generates ./sample.parquet covering every supported parquet type variation.
+// Generates public/sample.parquet covering every supported parquet type
+// variation. It is served as the dataset for the viewer's `?demo` mode.
 // Self-contained: uses @duckdb/node-api (Node-native binding, devDep).
 // No external duckdb CLI required.
 
 import { existsSync, rmSync } from "node:fs";
 import { DuckDBInstance } from "@duckdb/node-api";
 
-const OUT = "sample.parquet";
+const OUT = "public/sample.parquet";
 
 // DuckDB enums require an explicit CREATE TYPE before use.
 const CREATE_ENUM = `CREATE TYPE color AS ENUM ('red', 'green', 'blue');`;

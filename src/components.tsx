@@ -577,13 +577,24 @@ export function TopBar({
         background: "var(--bg-alt)",
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      <a
+        href="/"
+        title="Drix home"
+        aria-label="Drix home"
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          color: "inherit",
+          textDecoration: "none",
+        }}
+      >
         <img src="/logo.svg" width={22} height={22} alt="Drix logo" />
         <div style={{ fontWeight: 700, fontSize: 16 }}>
           Drix Viewer{" "}
           <span style={{ color: "var(--fg-muted)", fontWeight: 400, fontSize: 12 }}>parquet</span>
         </div>
-      </div>
+      </a>
       <div style={{ flex: 1 }} />
       <button type="button" onClick={onTheme} title="Toggle theme">
         {state.theme === "dark" ? "☀" : "☾"}
